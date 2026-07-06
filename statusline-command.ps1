@@ -147,7 +147,8 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     if ($filled -lt 0) { $filled = 0 }
     $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
 
-    $barColor = if ($pct -ge 90) { $red } elseif ($pct -ge 70) { $yellow } else { $green }
+    # Same 6-stage gradient as ctx% (warmer as the session fills)
+    $barColor = if ($pct -ge 83) { $ctxStage6 } elseif ($pct -ge 75) { $ctxStage5 } elseif ($pct -ge 60) { $ctxStage4 } elseif ($pct -ge 50) { $ctxStage3 } elseif ($pct -ge 30) { $ctxStage2 } else { $ctxStage1 }
 
     $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $remaining = [int]($fiveHour.resets_at - $nowEpoch)

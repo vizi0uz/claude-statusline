@@ -161,13 +161,19 @@ if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_r
     for ((i=0; i<filled; i++)); do bar+="█"; done
     for ((i=filled; i<bar_width; i++)); do bar+="░"; done
 
-    # Color the bar based on percentage
-    if [[ $pct -ge 90 ]]; then
-        bar_color="$red"
-    elif [[ $pct -ge 70 ]]; then
-        bar_color="$yellow"
+    # Color the bar with the same 6-stage gradient as ctx% (warmer as the session fills)
+    if [[ $pct -ge 83 ]]; then
+        bar_color="$ctx_stage6"
+    elif [[ $pct -ge 75 ]]; then
+        bar_color="$ctx_stage5"
+    elif [[ $pct -ge 60 ]]; then
+        bar_color="$ctx_stage4"
+    elif [[ $pct -ge 50 ]]; then
+        bar_color="$ctx_stage3"
+    elif [[ $pct -ge 30 ]]; then
+        bar_color="$ctx_stage2"
     else
-        bar_color="$green"
+        bar_color="$ctx_stage1"
     fi
 
     # Calculate time remaining
