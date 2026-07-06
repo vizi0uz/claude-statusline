@@ -57,16 +57,22 @@ if (Test-Path $settingsJson) {
     }
 }
 
-# Update statusLine block with absolute path
+# Update statusLine block with absolute path.
+# Use forward slashes: Claude Code runs the statusLine command through a POSIX-style
+# shell where backslashes are escape characters, so a backslash path would collapse
+# (C:\Users\... -> C:Users...) and fail silently, blanking the status line.
+$destScriptFwd = $destScript -replace '\\', '/'
 $settings.statusLine = @{
     type          = "command"
-    command       = "pwsh -NoProfile -File $destScript"
+    command       = "pwsh -NoProfile -File $destScriptFwd"
     refreshInterval = 30
 }
 
-# Write updated settings.json with utf8 encoding
+# Write updated settings.json as UTF-8 WITHOUT BOM. [System.Text.Encoding]::UTF8 emits a
+# BOM, which breaks the harness's JSON parser; UTF8Encoding($false) omits it.
 $json = $settings | ConvertTo-Json -Depth 10
-[System.IO.File]::WriteAllText($settingsJson, $json, [System.Text.Encoding]::UTF8)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($settingsJson, $json, $utf8NoBom)
 Write-Host "Patched settings.json with statusLine command at $destScript"
 
 Write-Host ""
