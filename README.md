@@ -1,3 +1,5 @@
+<img width="1024" height="138" alt="image" src="https://github.com/user-attachments/assets/53fe7a54-de9b-43de-aee9-27c8304abbf5" />
+
 # claude-statusline
 
 A portable, cross-platform status line renderer for Claude Code that displays model, effort level, context window usage, account info, and 5-hour rate limit status.
