@@ -15,6 +15,8 @@ $lanIp = $null
 $sessionId = $data.session_id
 
 # IP refresh interval (seconds): env var > ~/.claude/statusline-config.json > default
+$configPath = Join-Path $HOME ".claude/statusline-config.json"
+
 $ipRefreshSeconds = $null
 if ($env:CLAUDE_STATUSLINE_IP_REFRESH_SECONDS) {
     $parsed = 0
@@ -22,16 +24,31 @@ if ($env:CLAUDE_STATUSLINE_IP_REFRESH_SECONDS) {
         $ipRefreshSeconds = $parsed
     }
 }
-if (-not $ipRefreshSeconds) {
-    $configPath = Join-Path $HOME ".claude/statusline-config.json"
-    if (Test-Path $configPath) {
-        try {
-            $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
-            if ($cfg.ipRefreshSeconds) { $ipRefreshSeconds = [int]$cfg.ipRefreshSeconds }
-        } catch {}
-    }
+if (-not $ipRefreshSeconds -and (Test-Path $configPath)) {
+    try {
+        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+        if ($cfg.ipRefreshSeconds) { $ipRefreshSeconds = [int]$cfg.ipRefreshSeconds }
+    } catch {}
 }
 if (-not $ipRefreshSeconds) { $ipRefreshSeconds = 60 }
+
+# Account info refresh interval (seconds): env var > ~/.claude/statusline-config.json > default.
+# Unlike the IP check, this re-check spawns `claude auth status`, so the
+# default mirrors $ipRefreshSeconds rather than being shorter.
+$accountRefreshSeconds = $null
+if ($env:CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS) {
+    $parsed = 0
+    if ([int]::TryParse($env:CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS, [ref]$parsed)) {
+        $accountRefreshSeconds = $parsed
+    }
+}
+if (-not $accountRefreshSeconds -and (Test-Path $configPath)) {
+    try {
+        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+        if ($cfg.accountRefreshSeconds) { $accountRefreshSeconds = [int]$cfg.accountRefreshSeconds }
+    } catch {}
+}
+if (-not $accountRefreshSeconds) { $accountRefreshSeconds = 60 }
 
 # Best-effort LAN IP: ask the OS which local address it would route outbound
 # traffic from (a UDP "connect" just resolves the route, no packets sent).
@@ -71,10 +88,16 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     $cacheDirty = $false
     $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
-    # Account info rarely changes, so this stays "once ever"
-    $accountAlreadyValid = $cache.accountChecked -or ($accountPlan -and $accountEmail)
-    if (-not $accountAlreadyValid) {
+    $accountCheckedAt = [int64]($cache.accountCheckedAt)
+    $accountAge = $nowEpoch - $accountCheckedAt
+
+    # Re-check periodically rather than "once ever" — a resumed session reuses
+    # its session_id, so a permanent cache would keep showing a pre-switch
+    # account forever after logging into a different one mid-session.
+    $accountStillFresh = $accountPlan -and $accountEmail -and ($accountAge -lt $accountRefreshSeconds)
+    if (-not $accountStillFresh) {
         $cacheDirty = $true
+        $accountCheckedAt = $nowEpoch
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "claude"
@@ -90,9 +113,15 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
                     $textInfo = (Get-Culture).TextInfo
                     $accountPlan = $textInfo.ToTitleCase(($auth.subscriptionType -replace '_', ' '))
                     $accountEmail = $auth.email
+                } else {
+                    # Genuinely logged out — don't keep displaying a stale identity.
+                    $accountPlan = $null
+                    $accountEmail = $null
                 }
             } else {
                 $proc.Kill()
+                # Timed out — keep whatever plan/email was already cached
+                # (last known-good) and retry after the next interval.
             }
         } catch {}
     }
@@ -115,11 +144,11 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     if ($cacheDirty) {
         try {
             @{
-                plan           = $accountPlan
-                email          = $accountEmail
-                publicIp       = $publicIp
-                accountChecked = $true
-                ipCheckedAt    = $ipCheckedAt
+                plan             = $accountPlan
+                email            = $accountEmail
+                publicIp         = $publicIp
+                accountCheckedAt = $accountCheckedAt
+                ipCheckedAt      = $ipCheckedAt
             } | ConvertTo-Json | Out-File $accountCacheFile -Encoding utf8
         } catch {}
 

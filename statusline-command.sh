@@ -19,16 +19,23 @@ lan_ip=""
 # Cache directory and file
 cache_dir="${TMPDIR:-/tmp}"
 cache_file="$cache_dir/claude-statusline-account-$session_id.json"
+config_file="$HOME/.claude/statusline-config.json"
 
 # IP refresh interval (seconds): env var > ~/.claude/statusline-config.json > default
 ip_refresh_seconds="$CLAUDE_STATUSLINE_IP_REFRESH_SECONDS"
-if [[ -z "$ip_refresh_seconds" ]]; then
-    config_file="$HOME/.claude/statusline-config.json"
-    if [[ -f "$config_file" ]]; then
-        ip_refresh_seconds=$(jq -r '.ipRefreshSeconds // empty' "$config_file" 2>/dev/null)
-    fi
+if [[ -z "$ip_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
+    ip_refresh_seconds=$(jq -r '.ipRefreshSeconds // empty' "$config_file" 2>/dev/null)
 fi
 [[ "$ip_refresh_seconds" =~ ^[0-9]+$ ]] || ip_refresh_seconds=60
+
+# Account info refresh interval (seconds): env var > ~/.claude/statusline-config.json > default.
+# Unlike the IP check, this re-check spawns `claude auth status`, so the
+# default mirrors ip_refresh_seconds rather than being shorter.
+account_refresh_seconds="$CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS"
+if [[ -z "$account_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
+    account_refresh_seconds=$(jq -r '.accountRefreshSeconds // empty' "$config_file" 2>/dev/null)
+fi
+[[ "$account_refresh_seconds" =~ ^[0-9]+$ ]] || account_refresh_seconds=60
 
 # Best-effort LAN IP: ask the OS which local address it would route outbound
 # traffic from. This stays correct with multiple NICs/VPNs/Docker bridges,
@@ -65,17 +72,22 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
 
     account_plan=$(echo "$cache" | jq -r '.plan // empty' 2>/dev/null)
     account_email=$(echo "$cache" | jq -r '.email // empty' 2>/dev/null)
-    account_checked=$(echo "$cache" | jq -r '.accountChecked // false' 2>/dev/null)
+    account_checked_at=$(echo "$cache" | jq -r '.accountCheckedAt // 0' 2>/dev/null)
+    [[ "$account_checked_at" =~ ^[0-9]+$ ]] || account_checked_at=0
     public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
     ip_checked_at=$(echo "$cache" | jq -r '.ipCheckedAt // 0' 2>/dev/null)
     [[ "$ip_checked_at" =~ ^[0-9]+$ ]] || ip_checked_at=0
 
     cache_dirty=0
     now_epoch=$(date +%s)
+    account_age=$(( now_epoch - account_checked_at ))
 
-    # Fetch account info if not cached (plan/email rarely change, so this stays "once ever")
-    if [[ "$account_checked" != "true" ]] && [[ -z "$account_plan" || -z "$account_email" ]]; then
+    # Re-check periodically rather than "once ever" — a resumed session reuses
+    # its session_id, so a permanent cache would keep showing a pre-switch
+    # account forever after logging into a different one mid-session.
+    if [[ -z "$account_plan" || -z "$account_email" || $account_age -ge $account_refresh_seconds ]]; then
         cache_dirty=1
+        account_checked_at=$now_epoch
         auth_output=$(timeout 3 claude auth status --json 2>/dev/null)
         if [[ $? -eq 0 ]]; then
             logged_in=$(echo "$auth_output" | jq -r '.loggedIn // false' 2>/dev/null)
@@ -86,8 +98,15 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
                     account_plan=$(echo "$sub_type" | sed 's/_/ /g' | sed 's/\b\(.\)/\u\1/g')
                 fi
                 account_email=$(echo "$auth_output" | jq -r '.email // empty' 2>/dev/null)
+            else
+                # Genuinely logged out — don't keep displaying a stale identity.
+                account_plan=""
+                account_email=""
             fi
         fi
+        # else: the call failed/timed out — keep whatever plan/email was
+        # already cached (last known-good, same behavior as the IP fetch
+        # below) and retry after the next interval instead of every render.
     fi
 
     # Refresh public IP once the TTL elapses (or if we've never fetched it).
@@ -109,7 +128,8 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
             --arg email "$account_email" \
             --arg ip "$public_ip" \
             --argjson checkedAt "$ip_checked_at" \
-            '{plan: $plan, email: $email, publicIp: $ip, accountChecked: true, ipCheckedAt: $checkedAt}')
+            --argjson acctCheckedAt "$account_checked_at" \
+            '{plan: $plan, email: $email, publicIp: $ip, accountCheckedAt: $acctCheckedAt, ipCheckedAt: $checkedAt}')
         echo "$write_cache" > "$cache_file" 2>/dev/null
     fi
 

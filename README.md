@@ -90,28 +90,32 @@ When the flag is off:
 When the flag is on:
 - Hostname is always shown (never gated)
 - LAN IP is recomputed on every render (it's a local routing-table lookup, not a network call, so there's no cost to keeping it live)
-- Email and public IP are fetched and cached per session; public IP is re-checked once the refresh interval elapses (see below)
-- If a public IP refresh fails (e.g. DNS hiccup), the last known-good IP stays on screen instead of going blank, and it's retried after the interval — not stuck until the cache expires a day later
+- Account plan/email and public IP are fetched and cached per session, each re-checked periodically once its own refresh interval elapses (see below) — this is what lets the display catch up if you switch accounts or your public IP changes mid-session, instead of showing whatever was true the first time this session rendered
+- If a refresh fails (e.g. a DNS hiccup for the public IP, or `claude auth status` failing/timing out), the last known-good value stays on screen instead of going blank, and it's retried after the interval — not stuck until the cache expires a day later. The one exception: if `claude auth status` succeeds and reports you're logged out, plan/email are cleared immediately rather than kept stale.
 
-## Configuring the public IP refresh interval
+## Configuring refresh intervals
 
-The public IP is cached (it requires an HTTP round-trip to `api.ipify.org`), but unlike account plan/email it's re-checked periodically — useful if your public IP can change mid-session (e.g. toggling a VPN) or if a transient DNS failure left it blank. LAN IP is not affected by this setting since it's always computed live.
+Public IP and account plan/email are cached independently, each with its own refresh interval, since re-checking them costs differently (an HTTP round-trip to `api.ipify.org` vs. spawning `claude auth status`). LAN IP is not affected by either setting since it's always computed live.
 
-Precedence: environment variable → JSON config file → default (60 seconds).
+Precedence for both: environment variable → JSON config file → default (60 seconds each).
 
 ```bash
-# Environment variable (any positive integer, in seconds)
+# Environment variables (any positive integer, in seconds)
 export CLAUDE_STATUSLINE_IP_REFRESH_SECONDS=30
+export CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS=30
 ```
 
 Or via a config file at `~/.claude/statusline-config.json` (read on both platforms):
 ```json
 {
-  "ipRefreshSeconds": 30
+  "ipRefreshSeconds": 30,
+  "accountRefreshSeconds": 30
 }
 ```
 
-An invalid or missing value falls back to the 60-second default.
+An invalid or missing value falls back to the 60-second default for that setting.
+
+Note on resumed sessions: `claude --resume <id>` reuses the original session's cache, keyed by `session_id`. If you log into a different account and then resume a session that predates the switch, the display will pick up the new account within one `accountRefreshSeconds` window rather than showing the pre-switch account for the rest of the session.
 
 ## Dependencies
 
