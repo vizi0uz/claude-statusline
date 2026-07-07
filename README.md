@@ -6,17 +6,18 @@ A portable, cross-platform status line renderer for Claude Code that displays mo
 
 ## Features
 
-- **Rich status display:** Shows model name, effort level (color-coded), context window % (6-stage color gradient), account plan, email, and hostname
+- **Rich status display:** Shows model name, effort level (color-coded), context window % (6-stage color gradient), account plan, email, hostname, LAN IP, and public IP
 - **Rate limit bar:** 40-character rate limit visualization with countdown to reset
-- **Privacy-aware:** Email and public IP are only shown when explicitly enabled via environment flag
+- **Privacy-aware:** Email, LAN IP, and public IP are only shown when explicitly enabled via environment flag
 - **Portable:** Works on Windows (PowerShell 6+) and Linux/macOS (bash with jq/curl)
-- **Cross-session caching:** Caches account info per session to reduce API calls
+- **Cross-session caching:** Caches account info per session to reduce API calls; public IP is refreshed on a configurable interval instead of being fetched once and cached forever
+- **VPN/multi-NIC safe LAN IP:** Detected via a routing-table lookup (which local address would the OS use to reach the internet), not by enumerating all local addresses — stays correct even with VPNs, Docker bridges, or multiple NICs
 - **Auto-cleanup:** Prunes cache files older than 1 day
 
 ## Example Output
 
 ```
-claude-opus [high]  ctx:42%  Free  user@example.com  myhost
+claude-opus [high]  ctx:42%  Free  user@example.com  myhost / 192.168.1.42 (203.0.113.7)
 Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m
 ```
 
@@ -25,6 +26,8 @@ With identity flag off:
 claude-opus [high]  ctx:42%  myhost
 Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m
 ```
+
+The hostname segment degrades gracefully: `myhost / LAN_IP (WAN_IP)` when both are known, `myhost / LAN_IP` or `myhost (WAN_IP)` if only one resolved, or plain `myhost` if neither did (e.g. identity flag off).
 
 ## Installation
 
@@ -68,9 +71,9 @@ echo 'export CLAUDE_STATUSLINE_SHOW_IDENTITY=1' >> ~/.bashrc
 
 ## Privacy: The Identity Flag
 
-By default, email and public IP are **not** displayed. This is useful on shared or remote machines.
+By default, email, LAN IP, and public IP are **not** displayed. This is useful on shared or remote machines.
 
-To show account email and public IP (on trusted machines only):
+To show account email, LAN IP, and public IP (on trusted machines only):
 ```bash
 # Windows
 setx CLAUDE_STATUSLINE_SHOW_IDENTITY 1
@@ -80,14 +83,35 @@ export CLAUDE_STATUSLINE_SHOW_IDENTITY=1
 ```
 
 When the flag is off:
-- Account email and public IP are **not** fetched
-- No network calls to `api.ipify.org` or `claude auth status`
+- Account email, LAN IP, and public IP are **not** fetched
+- No network calls to `api.ipify.org` or `claude auth status`, and no local routing-table lookup
 - Only model, effort, context%, and hostname are shown
 
 When the flag is on:
 - Hostname is always shown (never gated)
-- Email and public IP are fetched and cached per session
-- If the network is unavailable, cached values are used (or omitted if no cache exists)
+- LAN IP is recomputed on every render (it's a local routing-table lookup, not a network call, so there's no cost to keeping it live)
+- Email and public IP are fetched and cached per session; public IP is re-checked once the refresh interval elapses (see below)
+- If a public IP refresh fails (e.g. DNS hiccup), the last known-good IP stays on screen instead of going blank, and it's retried after the interval — not stuck until the cache expires a day later
+
+## Configuring the public IP refresh interval
+
+The public IP is cached (it requires an HTTP round-trip to `api.ipify.org`), but unlike account plan/email it's re-checked periodically — useful if your public IP can change mid-session (e.g. toggling a VPN) or if a transient DNS failure left it blank. LAN IP is not affected by this setting since it's always computed live.
+
+Precedence: environment variable → JSON config file → default (60 seconds).
+
+```bash
+# Environment variable (any positive integer, in seconds)
+export CLAUDE_STATUSLINE_IP_REFRESH_SECONDS=30
+```
+
+Or via a config file at `~/.claude/statusline-config.json` (read on both platforms):
+```json
+{
+  "ipRefreshSeconds": 30
+}
+```
+
+An invalid or missing value falls back to the 60-second default.
 
 ## Dependencies
 
@@ -98,6 +122,7 @@ When the flag is on:
 - bash
 - jq (JSON query tool)
 - curl (HTTP client)
+- For LAN IP detection: `ip` (iproute2, most Linux distros) or `route`+`ifconfig` (macOS/BSD) or `hostname -I` as fallbacks, in that order. If none are available, the LAN IP segment is simply omitted.
 
 ## Color Codes
 

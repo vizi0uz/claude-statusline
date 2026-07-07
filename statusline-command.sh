@@ -14,12 +14,49 @@ rate_resets=$(echo "$json" | jq -r '.rate_limits.five_hour.resets_at // empty')
 account_plan=""
 account_email=""
 public_ip=""
+lan_ip=""
 
 # Cache directory and file
 cache_dir="${TMPDIR:-/tmp}"
 cache_file="$cache_dir/claude-statusline-account-$session_id.json"
 
+# IP refresh interval (seconds): env var > ~/.claude/statusline-config.json > default
+ip_refresh_seconds="$CLAUDE_STATUSLINE_IP_REFRESH_SECONDS"
+if [[ -z "$ip_refresh_seconds" ]]; then
+    config_file="$HOME/.claude/statusline-config.json"
+    if [[ -f "$config_file" ]]; then
+        ip_refresh_seconds=$(jq -r '.ipRefreshSeconds // empty' "$config_file" 2>/dev/null)
+    fi
+fi
+[[ "$ip_refresh_seconds" =~ ^[0-9]+$ ]] || ip_refresh_seconds=60
+
+# Best-effort LAN IP: ask the OS which local address it would route outbound
+# traffic from. This stays correct with multiple NICs/VPNs/Docker bridges,
+# unlike enumerating all local addresses. It's a local routing-table lookup
+# (no packets sent), so it's cheap enough to compute fresh every render.
+get_lan_ip() {
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+    fi
+    if [[ -z "$ip" ]] && command -v route >/dev/null 2>&1 && command -v ifconfig >/dev/null 2>&1; then
+        local iface
+        iface=$(route get 8.8.8.8 2>/dev/null | awk '/interface:/{print $2}')
+        if [[ -n "$iface" ]]; then
+            ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')
+        fi
+    fi
+    if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "$ip"
+}
+
 # Only fetch identity-related data if the flag is explicitly enabled
+if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]]; then
+    lan_ip=$(get_lan_ip)
+fi
+
 if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; then
     cache=""
     if [[ -f "$cache_file" ]]; then
@@ -28,13 +65,15 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
 
     account_plan=$(echo "$cache" | jq -r '.plan // empty' 2>/dev/null)
     account_email=$(echo "$cache" | jq -r '.email // empty' 2>/dev/null)
-    public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
     account_checked=$(echo "$cache" | jq -r '.accountChecked // false' 2>/dev/null)
-    ip_checked=$(echo "$cache" | jq -r '.ipChecked // false' 2>/dev/null)
+    public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
+    ip_checked_at=$(echo "$cache" | jq -r '.ipCheckedAt // 0' 2>/dev/null)
+    [[ "$ip_checked_at" =~ ^[0-9]+$ ]] || ip_checked_at=0
 
     cache_dirty=0
+    now_epoch=$(date +%s)
 
-    # Fetch account info if not cached
+    # Fetch account info if not cached (plan/email rarely change, so this stays "once ever")
     if [[ "$account_checked" != "true" ]] && [[ -z "$account_plan" || -z "$account_email" ]]; then
         cache_dirty=1
         auth_output=$(timeout 3 claude auth status --json 2>/dev/null)
@@ -51,10 +90,16 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
         fi
     fi
 
-    # Fetch public IP if not cached
-    if [[ "$ip_checked" != "true" ]] && [[ -z "$public_ip" ]]; then
+    # Refresh public IP once the TTL elapses (or if we've never fetched it).
+    # A failed fetch (e.g. DNS timeout) keeps the last known-good IP on screen
+    # and still bumps the timestamp, so we retry after the interval instead of
+    # re-stalling on a broken resolver every single render.
+    ip_age=$(( now_epoch - ip_checked_at ))
+    if [[ -z "$public_ip" || $ip_age -ge $ip_refresh_seconds ]]; then
+        new_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null)
+        [[ -n "$new_ip" ]] && public_ip="$new_ip"
+        ip_checked_at=$now_epoch
         cache_dirty=1
-        public_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null)
     fi
 
     # Write cache if it was updated
@@ -63,7 +108,8 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
             --arg plan "$account_plan" \
             --arg email "$account_email" \
             --arg ip "$public_ip" \
-            '{plan: $plan, email: $email, publicIp: $ip, accountChecked: true, ipChecked: true}')
+            --argjson checkedAt "$ip_checked_at" \
+            '{plan: $plan, email: $email, publicIp: $ip, accountChecked: true, ipCheckedAt: $checkedAt}')
         echo "$write_cache" > "$cache_file" 2>/dev/null
     fi
 
@@ -134,13 +180,15 @@ if [[ -n "$account_plan" || -n "$account_email" ]]; then
     line="$line  ${green}${account_plan}${reset} ${gray}·${reset} ${cyan}${account_email}${reset}"
 fi
 
-# Hostname
+# Hostname / LAN IP (WAN IP)
 hostname_val="${HOSTNAME:-$(hostname 2>/dev/null)}"
 if [[ -n "$hostname_val" ]]; then
+    line="$line  ${cyan}${hostname_val}${reset}"
+    if [[ -n "$lan_ip" ]]; then
+        line="$line ${gray}/${reset} ${cyan}${lan_ip}${reset}"
+    fi
     if [[ -n "$public_ip" ]]; then
-        line="$line  ${cyan}${hostname_val}${reset} ${gray}(${reset}${cyan}${public_ip}${reset}${gray})${reset}"
-    else
-        line="$line  ${cyan}${hostname_val}${reset}"
+        line="$line ${gray}(${reset}${cyan}${public_ip}${reset}${gray})${reset}"
     fi
 fi
 

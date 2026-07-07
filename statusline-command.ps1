@@ -11,9 +11,52 @@ $used = $data.context_window.used_percentage
 $accountPlan = $null
 $accountEmail = $null
 $publicIp = $null
+$lanIp = $null
 $sessionId = $data.session_id
 
+# IP refresh interval (seconds): env var > ~/.claude/statusline-config.json > default
+$ipRefreshSeconds = $null
+if ($env:CLAUDE_STATUSLINE_IP_REFRESH_SECONDS) {
+    $parsed = 0
+    if ([int]::TryParse($env:CLAUDE_STATUSLINE_IP_REFRESH_SECONDS, [ref]$parsed)) {
+        $ipRefreshSeconds = $parsed
+    }
+}
+if (-not $ipRefreshSeconds) {
+    $configPath = Join-Path $HOME ".claude/statusline-config.json"
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+            if ($cfg.ipRefreshSeconds) { $ipRefreshSeconds = [int]$cfg.ipRefreshSeconds }
+        } catch {}
+    }
+}
+if (-not $ipRefreshSeconds) { $ipRefreshSeconds = 60 }
+
+# Best-effort LAN IP: ask the OS which local address it would route outbound
+# traffic from (a UDP "connect" just resolves the route, no packets sent).
+# This stays correct with multiple NICs/VPNs, unlike enumerating all local
+# addresses, and it's cheap enough to compute fresh every render.
+function Get-LanIp {
+    try {
+        $socket = New-Object System.Net.Sockets.Socket(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.SocketType]::Dgram,
+            [System.Net.Sockets.ProtocolType]::Udp)
+        $socket.Connect("8.8.8.8", 65530)
+        $ip = $socket.LocalEndPoint.Address.ToString()
+        $socket.Close()
+        return $ip
+    } catch {
+        return $null
+    }
+}
+
 # Only fetch identity-related data if the flag is explicitly enabled
+if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1') {
+    $lanIp = Get-LanIp
+}
+
 if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     $accountCacheFile = "$env:TEMP\claude-statusline-account-$sessionId.json"
 
@@ -26,7 +69,9 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     $accountEmail = $cache.email
     $publicIp = $cache.publicIp
     $cacheDirty = $false
+    $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
+    # Account info rarely changes, so this stays "once ever"
     $accountAlreadyValid = $cache.accountChecked -or ($accountPlan -and $accountEmail)
     if (-not $accountAlreadyValid) {
         $cacheDirty = $true
@@ -52,12 +97,19 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
         } catch {}
     }
 
-    $ipAlreadyValid = $cache.ipChecked -or $publicIp
-    if (-not $ipAlreadyValid) {
+    # Refresh public IP once the TTL elapses (or if we've never fetched it).
+    # A failed fetch keeps the last known-good IP on screen and still bumps
+    # the timestamp, so we retry after the interval instead of re-stalling on
+    # a broken DNS/network every single render.
+    $ipCheckedAt = [int64]($cache.ipCheckedAt)
+    $ipAge = $nowEpoch - $ipCheckedAt
+    if (-not $publicIp -or $ipAge -ge $ipRefreshSeconds) {
         $cacheDirty = $true
         try {
-            $publicIp = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 3
+            $newIp = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 3
+            if ($newIp) { $publicIp = $newIp }
         } catch {}
+        $ipCheckedAt = $nowEpoch
     }
 
     if ($cacheDirty) {
@@ -67,7 +119,7 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
                 email          = $accountEmail
                 publicIp       = $publicIp
                 accountChecked = $true
-                ipChecked      = $true
+                ipCheckedAt    = $ipCheckedAt
             } | ConvertTo-Json | Out-File $accountCacheFile -Encoding utf8
         } catch {}
 
@@ -128,10 +180,12 @@ if ($accountPlan -or $accountEmail) {
 
 $hostname = $env:COMPUTERNAME
 if ($hostname) {
+    $line = "$line  ${cyan}${hostname}${reset}"
+    if ($lanIp) {
+        $line = "$line ${gray}/${reset} ${cyan}${lanIp}${reset}"
+    }
     if ($publicIp) {
-        $line = "$line  ${cyan}${hostname}${reset} ${gray}(${reset}${cyan}${publicIp}${reset}${gray})${reset}"
-    } else {
-        $line = "$line  ${cyan}${hostname}${reset}"
+        $line = "$line ${gray}(${reset}${cyan}${publicIp}${reset}${gray})${reset}"
     }
 }
 
