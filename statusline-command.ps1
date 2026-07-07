@@ -205,7 +205,9 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     $barColor = if ($pct -ge 83) { $ctxStage6 } elseif ($pct -ge 75) { $ctxStage5 } elseif ($pct -ge 60) { $ctxStage4 } elseif ($pct -ge 50) { $ctxStage3 } elseif ($pct -ge 30) { $ctxStage2 } else { $ctxStage1 }
 
     $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $remaining = [int]($fiveHour.resets_at - $nowEpoch)
+    # Use [long] (Int64): resets_at is epoch seconds, and the difference can
+    # exceed Int32 range, which would throw a cast error and blank the timer.
+    $remaining = [long]($fiveHour.resets_at - $nowEpoch)
     if ($remaining -lt 0) { $remaining = 0 }
     $hours = [int][math]::Floor($remaining / 3600)
     $minutes = [int][math]::Floor(($remaining % 3600) / 60)
