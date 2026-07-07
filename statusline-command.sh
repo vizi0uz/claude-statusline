@@ -227,7 +227,11 @@ if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_r
     # Calculate time remaining
     now_epoch=$(date +%s)
     remaining=$((rate_resets - now_epoch))
-    if [[ $remaining -lt 0 ]]; then remaining=0; fi
+    stale=0
+    if [[ $remaining -le 0 ]]; then
+        stale=1
+        remaining=0
+    fi
 
     hours=$((remaining / 3600))
     minutes=$(((remaining % 3600) / 60))
@@ -238,6 +242,13 @@ if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_r
         reset_str="${minutes}m"
     fi
 
-    session_line="${gray}Session ${reset}${bar_color}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${reset_str}"
+    # resets_at has passed, but Claude Code only refreshes rate_limits on the
+    # next API call, so pct above may be a stale snapshot too — flag it rather
+    # than show a countdown frozen at 0m.
+    if [[ $stale -eq 1 ]]; then
+        session_line="${gray}Session ${reset}${bar_color}${bar}${reset} ${pct}% used ${gray}· awaiting refresh${reset}"
+    else
+        session_line="${gray}Session ${reset}${bar_color}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${reset_str}"
+    fi
     printf "%b" "$session_line"
 fi

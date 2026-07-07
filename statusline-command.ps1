@@ -208,11 +208,19 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     # Use [long] (Int64): resets_at is epoch seconds, and the difference can
     # exceed Int32 range, which would throw a cast error and blank the timer.
     $remaining = [long]($fiveHour.resets_at - $nowEpoch)
+    $stale = $remaining -le 0
     if ($remaining -lt 0) { $remaining = 0 }
     $hours = [int][math]::Floor($remaining / 3600)
     $minutes = [int][math]::Floor(($remaining % 3600) / 60)
     $resetStr = if ($hours -gt 0) { "${hours}h ${minutes}m" } else { "${minutes}m" }
 
-    $sessionLine = "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${resetStr}"
+    # resets_at has passed, but Claude Code only refreshes rate_limits on the
+    # next API call, so pct above may be a stale snapshot too — flag it rather
+    # than show a countdown frozen at 0m.
+    $sessionLine = if ($stale) {
+        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}· awaiting refresh${reset}"
+    } else {
+        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${resetStr}"
+    }
     Write-Host -NoNewline $sessionLine
 }
