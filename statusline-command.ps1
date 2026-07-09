@@ -100,8 +100,12 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
         $accountCheckedAt = $nowEpoch
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "claude"
-            $psi.Arguments = "auth status --json"
+            # Route through cmd.exe: Process.Start with UseShellExecute=false
+            # does its own CreateProcess lookup, which does not apply PATHEXT
+            # the way a shell does — a bare FileName="claude" fails to find
+            # claude.cmd shims (nvm/conda installs) even though they're on PATH.
+            $psi.FileName = "cmd.exe"
+            $psi.Arguments = "/c claude auth status --json"
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
             $psi.UseShellExecute = $false
