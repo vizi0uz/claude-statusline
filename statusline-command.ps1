@@ -175,6 +175,91 @@ $magenta   = "`e[95m"
 $boldWhite = "`e[1;97m"
 $reset     = "`e[0m"
 
+# ---- Cache-efficiency indicator ----
+# Price-weighted cache-savings ratio, pooled over the last N turns:
+#   savings = ( (1 - W_READ)*R - (W_WRITE - 1)*W ) / (F + W + R)
+# Scale-invariant (absolute per-token price cancels), bounded in [-(W_WRITE-1), 1-W_READ].
+# context_window.current_usage is a per-call snapshot, not cumulative, so state is persisted
+# per-session in the temp dir (same pattern as the account-info cache above) and pooled here.
+$cacheWRead    = 0.10   # cache-read price / base-input price
+$cacheWWrite   = 1.25   # cache-write price / base-input price (5-min TTL)
+$cacheN        = 5      # rolling window length, in turns
+$cacheGreenAt  = 0.70   # savings >= this -> green
+$cacheBarCells = 10
+$cacheCeil     = 1.0 - $cacheWRead
+
+$cost = $data.cost.total_cost_usd
+$cacheCurrentUsage = $data.context_window.current_usage
+
+$cacheSid = ($sessionId -replace '[^a-zA-Z0-9_-]', '')
+if (-not $cacheSid) { $cacheSid = "default" }
+$cacheStateFile = Join-Path $env:TEMP "claude-statusline-cache-$cacheSid.json"
+
+$cacheState = $null
+if (Test-Path $cacheStateFile) {
+    try {
+        $loaded = Get-Content $cacheStateFile -Raw | ConvertFrom-Json
+        if ($loaded -and ($loaded.PSObject.Properties.Name -contains 'turns')) {
+            $cacheState = $loaded
+        }
+    } catch {}
+}
+if (-not $cacheState) {
+    $cacheState = [PSCustomObject]@{ last_cost = $null; turns = @() }
+}
+# ConvertFrom-Json collapses a one-element JSON array to a single object, not an array — force it back.
+$cacheTurns = @($cacheState.turns)
+
+# Turn-boundary detection: a new billed API call changes total_cost_usd, and current_usage
+# holds that same call's composition. Log once per call, not once per render.
+if ($null -ne $cacheCurrentUsage -and $null -ne $cost -and $cost -ne $cacheState.last_cost) {
+    $cacheF = $cacheCurrentUsage.input_tokens
+    if ($null -eq $cacheF) { $cacheF = 0 }
+    $cacheWTok = $cacheCurrentUsage.cache_creation_input_tokens
+    if ($null -eq $cacheWTok) { $cacheWTok = 0 }
+    $cacheRTok = $cacheCurrentUsage.cache_read_input_tokens
+    if ($null -eq $cacheRTok) { $cacheRTok = 0 }
+
+    $cacheTurns += [PSCustomObject]@{ F = $cacheF; W = $cacheWTok; R = $cacheRTok }
+    if ($cacheTurns.Count -gt $cacheN) {
+        $cacheTurns = $cacheTurns[($cacheTurns.Count - $cacheN)..($cacheTurns.Count - 1)]
+    }
+
+    try {
+        $newCacheState = [PSCustomObject]@{ last_cost = $cost; turns = $cacheTurns }
+        $cacheTmpFile = "$cacheStateFile.tmp"
+        $newCacheState | ConvertTo-Json -Depth 5 | Out-File $cacheTmpFile -Encoding utf8
+        Move-Item -Force $cacheTmpFile $cacheStateFile
+    } catch {}
+
+    # Prune cache-window files older than 1 day — gated to at most once per day via a marker
+    # file. A turn boundary can hit multiple times per session, and a wildcard directory scan
+    # over a busy temp dir (e.g. antivirus scanning each entry) can cost multiple seconds; a
+    # per-write scan would make that tax recur on every single turn.
+    try {
+        $cachePruneMarker = Join-Path $env:TEMP ".claude-statusline-cache-pruned-at"
+        $cachePruneDue = $true
+        if (Test-Path $cachePruneMarker) {
+            $cachePruneAge = (Get-Date) - (Get-Item $cachePruneMarker).LastWriteTime
+            if ($cachePruneAge.TotalSeconds -lt 86400) { $cachePruneDue = $false }
+        }
+        if ($cachePruneDue) {
+            Set-Content -Path $cachePruneMarker -Value "" -NoNewline -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:TEMP\claude-statusline-cache-*.json" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne "claude-statusline-cache-$cacheSid.json" -and $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+$cachePoolF = 0; $cachePoolW = 0; $cachePoolR = 0
+foreach ($cacheTurn in $cacheTurns) {
+    $cachePoolF += $cacheTurn.F
+    $cachePoolW += $cacheTurn.W
+    $cachePoolR += $cacheTurn.R
+}
+$cacheDenom = $cachePoolF + $cachePoolW + $cachePoolR
+
 # ctx% stage framework (truecolor, thresholds from the Opus staging table)
 $ctxStage1 = "`e[38;2;34;197;94m"    # 0-30%   Green    #22c55e  Optimal
 $ctxStage2 = "`e[38;2;20;184;166m"   # 30-50%  Teal     #14b8a6  Healthy
@@ -255,5 +340,37 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     } else {
         "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${resetStr}"
     }
+
+    # Cache-efficiency segment, appended after the Session bar on the same line.
+    if ($cacheDenom -eq 0) {
+        $cacheSegment = "  ${gray}·${reset}  ${gray}cache ······ warming up${reset}"
+    } else {
+        $cacheSavings = ((1 - $cacheWRead) * $cachePoolR - ($cacheWWrite - 1) * $cachePoolW) / $cacheDenom
+
+        if ($cacheSavings -lt 0) { $cacheColor = $red }
+        elseif ($cacheSavings -lt $cacheGreenAt) { $cacheColor = $yellow }
+        else { $cacheColor = $green }
+
+        $cacheClamped = $cacheSavings
+        if ($cacheClamped -lt 0) { $cacheClamped = 0 }
+        if ($cacheClamped -gt $cacheCeil) { $cacheClamped = $cacheCeil }
+        $cacheFill = [int][math]::Round($cacheClamped / $cacheCeil * $cacheBarCells)
+        $cacheBar = ('▓' * $cacheFill) + ('░' * ($cacheBarCells - $cacheFill))
+
+        $cacheWarn = ""
+        if ($cacheSavings -lt 0) { $cacheWarn = " ${red}⚠${reset}" }
+
+        $cachePct = [int][math]::Round($cacheSavings * 100)
+
+        $cacheCostStr = ""
+        if ($null -ne $cost) {
+            $cacheCostFmt = $cost.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
+            $cacheCostStr = "  ${gray}·${reset}  " + '$' + $cacheCostFmt
+        }
+
+        $cacheSegment = "  ${gray}·${reset}  ${gray}cache${reset} ${cacheColor}${cacheBar} ${cachePct}%${reset}${cacheWarn}${cacheCostStr}"
+    }
+    $sessionLine = "$sessionLine$cacheSegment"
+
     Write-Host -NoNewline $sessionLine
 }

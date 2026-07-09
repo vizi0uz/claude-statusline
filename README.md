@@ -8,6 +8,7 @@ A portable, cross-platform status line renderer for Claude Code that displays mo
 
 - **Rich status display:** Shows model name, effort level (color-coded), context window % (6-stage color gradient), account plan, email, hostname, LAN IP, and public IP
 - **Rate limit bar:** 40-character rate limit visualization with countdown to reset
+- **Cache-efficiency indicator:** Compact bar showing price-weighted cache savings pooled over the last 5 turns, appended after the Session bar — dips into yellow/red when the cached prompt prefix churns instead of being read cheaply
 - **Privacy-aware:** Email, LAN IP, and public IP are only shown when explicitly enabled via environment flag
 - **Portable:** Works on Windows (PowerShell 6+) and Linux/macOS (bash with jq/curl)
 - **Cross-session caching:** Caches account info per session to reduce API calls; public IP is refreshed on a configurable interval instead of being fetched once and cached forever
@@ -18,13 +19,13 @@ A portable, cross-platform status line renderer for Claude Code that displays mo
 
 ```
 claude-opus [high]  ctx:42%  Free  user@example.com  myhost / 192.168.1.42 (203.0.113.7)
-Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m
+Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m  ·  cache ▓▓▓▓▓▓▓▓▓░ 85%  ·  $1.21
 ```
 
 With identity flag off:
 ```
 claude-opus [high]  ctx:42%  myhost
-Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m
+Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m  ·  cache ▓▓▓▓▓▓▓▓▓░ 85%  ·  $1.21
 ```
 
 The hostname segment degrades gracefully: `myhost / LAN_IP (WAN_IP)` when both are known, `myhost / LAN_IP` or `myhost (WAN_IP)` if only one resolved, or plain `myhost` if neither did (e.g. identity flag off).
@@ -150,6 +151,22 @@ Note on resumed sessions: `claude --resume <id>` reuses the original session's c
 - 70–90%: Yellow
 - 90%+: Red
 
+### Cache Efficiency
+
+Shows a price-weighted cache-savings ratio pooled over the last 5 API calls in the session:
+`savings = ((1 - 0.10) × cache_read - (1.25 - 1) × cache_write) / (fresh + cache_write + cache_read)`.
+It's a cost-efficiency gauge, not a context-fullness one — a well-cached session reads high/green
+even with heavy output; it dips when the cached prompt prefix gets invalidated and re-written
+(churn) instead of being read cheaply.
+
+- Green (≥70%): strong cache reuse, near steady state
+- Yellow (0–70%): caching helps, but reuse is mediocre or recent churn is dragging the pool
+- Red (<0%, `⚠`): net loss over the window — real churn
+
+Requires `rate_limits` to be present (Claude.ai Pro/Max subscribers, after the first API
+response), since it's appended after the Session bar on the same line. Shows `cache ······ warming up`
+when the rolling window is still empty (mainly right after `/compact`).
+
 ## Verification
 
 To test the status line manually:
@@ -159,22 +176,31 @@ To test the status line manually:
 $json = @{
     model = @{ display_name = "claude-opus" }
     effort = @{ level = "high" }
-    context_window = @{ used_percentage = 42 }
+    context_window = @{
+        used_percentage = 42
+        current_usage = @{
+            input_tokens = 500
+            cache_creation_input_tokens = 2000
+            cache_read_input_tokens = 50000
+            output_tokens = 1200
+        }
+    }
+    cost = @{ total_cost_usd = 1.21 }
     session_id = "test"
     rate_limits = @{
         five_hour = @{
             used_percentage = 40
-            resets_at = (Get-Date).AddSeconds(7800).ToUnixTimeSeconds()
+            resets_at = [DateTimeOffset]::UtcNow.AddSeconds(7800).ToUnixTimeSeconds()
         }
     }
-} | ConvertTo-Json
+} | ConvertTo-Json -Depth 5
 
 $json | pwsh -NoProfile -File statusline-command.ps1
 ```
 
 ```bash
 # Linux/macOS
-json='{"model":{"display_name":"claude-opus"},"effort":{"level":"high"},"context_window":{"used_percentage":42},"session_id":"test","rate_limits":{"five_hour":{"used_percentage":40,"resets_at":'$(($(date +%s) + 7800))'}}}' 
+json='{"model":{"display_name":"claude-opus"},"effort":{"level":"high"},"context_window":{"used_percentage":42,"current_usage":{"input_tokens":500,"cache_creation_input_tokens":2000,"cache_read_input_tokens":50000,"output_tokens":1200}},"cost":{"total_cost_usd":1.21},"session_id":"test","rate_limits":{"five_hour":{"used_percentage":40,"resets_at":'$(($(date +%s) + 7800))'}}}' 
 
 echo "$json" | bash statusline-command.sh
 ```

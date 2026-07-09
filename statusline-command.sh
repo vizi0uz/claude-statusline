@@ -137,6 +137,86 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
     find "$cache_dir" -name "claude-statusline-account-*.json" -type f -mtime +1 ! -name "claude-statusline-account-$session_id.json" -delete 2>/dev/null
 fi
 
+# ---- Cache-efficiency indicator ----
+# Price-weighted cache-savings ratio, pooled over the last N turns:
+#   savings = ( (1 - W_READ)*R - (W_WRITE - 1)*W ) / (F + W + R)
+# context_window.current_usage is a per-call snapshot, not cumulative, so state is persisted
+# per-session in the temp dir (same pattern as the account-info cache above) and pooled here.
+# jq does the floating-point math; bash has no native float arithmetic.
+cache_w_read=0.10      # cache-read price / base-input price
+cache_w_write=1.25     # cache-write price / base-input price (5-min TTL)
+cache_n=5              # rolling window length, in turns
+cache_green_at=0.70    # savings >= this -> green
+cache_bar_cells=10
+
+cost=$(echo "$json" | jq -r '.cost.total_cost_usd // empty')
+cu_present=$(echo "$json" | jq -r 'if .context_window.current_usage == null then "0" else "1" end')
+cu_f=$(echo "$json" | jq -r '.context_window.current_usage.input_tokens // 0')
+cu_w=$(echo "$json" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
+cu_r=$(echo "$json" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+
+cache_sid=$(echo "$session_id" | tr -cd 'a-zA-Z0-9_-')
+[[ -z "$cache_sid" ]] && cache_sid="default"
+cache_state_file="$cache_dir/claude-statusline-cache-$cache_sid.json"
+
+cache_state=""
+if [[ -f "$cache_state_file" ]]; then
+    cache_state=$(cat "$cache_state_file" 2>/dev/null)
+fi
+if ! echo "$cache_state" | jq -e '.turns | type == "array"' >/dev/null 2>&1; then
+    cache_state='{"last_cost":null,"turns":[]}'
+fi
+
+last_cost=$(echo "$cache_state" | jq -r '.last_cost // empty')
+
+# Turn-boundary detection: a new billed API call changes total_cost_usd, and current_usage
+# holds that same call's composition. Log once per call, not once per render.
+if [[ "$cu_present" == "1" ]] && [[ -n "$cost" ]] && [[ "$cost" != "$last_cost" ]]; then
+    cache_state=$(echo "$cache_state" | jq \
+        --argjson f "$cu_f" --argjson w "$cu_w" --argjson r "$cu_r" \
+        --argjson cost "$cost" --argjson n "$cache_n" \
+        '.turns += [{"F":$f,"W":$w,"R":$r}] | .turns = (.turns[-$n:]) | .last_cost = $cost')
+    cache_tmp_file="$cache_state_file.tmp.$$"
+    echo "$cache_state" > "$cache_tmp_file" 2>/dev/null && mv -f "$cache_tmp_file" "$cache_state_file" 2>/dev/null
+
+    # Prune cache-window files older than 1 day — gated to at most once per day via a
+    # marker file. A turn boundary can hit multiple times per session, and a directory-wide
+    # `find` over a busy temp dir (e.g. antivirus scanning each entry on Windows) can cost
+    # multiple seconds; a per-write scan would make that tax recur on every single turn.
+    cache_prune_marker="$cache_dir/.claude-statusline-cache-pruned-at"
+    cache_prune_due=1
+    if [[ -f "$cache_prune_marker" ]]; then
+        cache_prune_mtime=$(stat -c %Y "$cache_prune_marker" 2>/dev/null || stat -f %m "$cache_prune_marker" 2>/dev/null || echo 0)
+        [[ $(( $(date +%s) - cache_prune_mtime )) -lt 86400 ]] && cache_prune_due=0
+    fi
+    if [[ $cache_prune_due -eq 1 ]]; then
+        touch "$cache_prune_marker" 2>/dev/null
+        find "$cache_dir" -name "claude-statusline-cache-*.json" -type f -mtime +1 ! -name "claude-statusline-cache-$cache_sid.json" -delete 2>/dev/null
+    fi
+fi
+
+# Pool F/W/R across retained turns and compute savings/zone/fill/pct in one jq call.
+cache_computed=$(echo "$cache_state" | jq -r \
+    --argjson wread "$cache_w_read" --argjson wwrite "$cache_w_write" \
+    --argjson green "$cache_green_at" --argjson cells "$cache_bar_cells" '
+    ( [.turns[].F] | add // 0 ) as $F |
+    ( [.turns[].W] | add // 0 ) as $W |
+    ( [.turns[].R] | add // 0 ) as $R |
+    ($F + $W + $R) as $denom |
+    if $denom == 0 then
+        "0\t0\tnone"
+    else
+        (((1 - $wread) * $R - ($wwrite - 1) * $W) / $denom) as $s |
+        (if $s < 0 then "red" elif $s < $green then "yellow" else "green" end) as $zone |
+        ([$s, 0] | max) as $c0 |
+        ([$c0, (1 - $wread)] | min) as $clamped |
+        (($clamped / (1 - $wread) * $cells) | round) as $fill |
+        (($s * 100) | round) as $pct |
+        "\($pct)\t\($fill)\t\($zone)"
+    end
+')
+IFS=$'\t' read -r cache_pct cache_fill cache_zone <<< "$cache_computed"
+
 # ANSI color codes
 cyan='\033[36m'
 gray='\033[90m'
@@ -270,5 +350,33 @@ if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_r
     else
         session_line="${gray}Session ${reset}${bar_color}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${reset_str}"
     fi
+
+    # Cache-efficiency segment, appended after the Session bar on the same line.
+    if [[ "$cache_zone" == "none" ]]; then
+        cache_segment="  ${gray}·${reset}  ${gray}cache ······ warming up${reset}"
+    else
+        case "$cache_zone" in
+            red)    cache_color="$red" ;;
+            yellow) cache_color="$yellow" ;;
+            green)  cache_color="$green" ;;
+        esac
+
+        cache_bar=""
+        for ((i=0; i<cache_fill; i++)); do cache_bar+="▓"; done
+        for ((i=cache_fill; i<cache_bar_cells; i++)); do cache_bar+="░"; done
+
+        cache_warn=""
+        [[ "$cache_zone" == "red" ]] && cache_warn=" ${red}⚠${reset}"
+
+        cache_cost_str=""
+        if [[ -n "$cost" ]]; then
+            cache_cost_fmt=$(printf '%.2f' "$cost")
+            cache_cost_str="  ${gray}·${reset}  \$${cache_cost_fmt}"
+        fi
+
+        cache_segment="  ${gray}·${reset}  ${gray}cache${reset} ${cache_color}${cache_bar} ${cache_pct}%${reset}${cache_warn}${cache_cost_str}"
+    fi
+    session_line="${session_line}${cache_segment}"
+
     printf "%b" "$session_line"
 fi
