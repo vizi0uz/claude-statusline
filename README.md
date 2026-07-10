@@ -1,5 +1,7 @@
 # claude-statusline
 
+[![npm installer · cc-statusline](https://img.shields.io/badge/npm%20installer-cc--statusline-blue)](https://www.npmjs.com/package/@viziouz/cc-statusline)
+
 A portable, cross-platform status line renderer for Claude Code that displays model, effort level, context window usage, account info, and 5-hour rate limit status.
 
 ## Features
@@ -30,7 +32,35 @@ The hostname segment degrades gracefully: `myhost / LAN_IP (WAN_IP)` when both a
 
 ## Installation
 
-### Windows (PowerShell 6+)
+### Quick install (npx) — recommended
+
+The scripts in this repo are also published as a zero-clone installer, [`@viziouz/cc-statusline`](https://github.com/vizi0uz/cc-statusline) on npm:
+
+```bash
+npx @viziouz/cc-statusline@latest
+```
+
+This copies a self-contained Node launcher plus the platform scripts into `~/.claude/cc-statusline/` and merges a `statusLine` block into `~/.claude/settings.json`, backing up your prior settings to `settings.json.bak` first. Works on Windows, macOS, and Linux with one command; requires Node.js ≥14.14.
+
+On a real terminal it asks whether to show identity info (Plan/Email/LAN/WAN IP — off by default); skip the prompt with an explicit flag:
+```bash
+npx @viziouz/cc-statusline@latest setup --show-identity     # turn identity fields on
+npx @viziouz/cc-statusline@latest setup --no-show-identity  # keep them off
+```
+
+To uninstall:
+```bash
+npx @viziouz/cc-statusline@latest uninstall
+# non-interactive / scripted:
+npx @viziouz/cc-statusline@latest uninstall --yes
+```
+This removes the `statusLine` block it added (only if it still points at its own launcher) and deletes `~/.claude/cc-statusline`.
+
+### Manual install (from this repo)
+
+Prefer this if you're developing or auditing this repo directly, or don't want to use npm.
+
+#### Windows (PowerShell 6+)
 ```powershell
 .\install.ps1
 ```
@@ -51,7 +81,7 @@ Or via command line:
 setx CLAUDE_STATUSLINE_SHOW_IDENTITY 1
 ```
 
-### Linux / macOS (bash)
+#### Linux / macOS (bash)
 ```bash
 ./install.sh
 ```
@@ -164,6 +194,87 @@ even with heavy output; it dips when the cached prompt prefix gets invalidated a
 Requires `rate_limits` to be present (Claude.ai Pro/Max subscribers, after the first API
 response), since it's appended after the Session bar on the same line. Shows `cache ······ warming up`
 when the rolling window is still empty (mainly right after `/compact`).
+
+## Understanding the Cache-Efficiency Indicator
+
+### What it measures
+
+The indicator answers one specific question: *how efficiently is Claude Code reusing cached
+context over the last few turns, in dollar terms.* It is **not** a context-window-fullness
+indicator — that's what the separate `ctx NN%` segment is for. This one exists to catch the
+case where you're quietly burning money because the cache keeps getting invalidated and
+rewritten instead of being read back cheaply.
+
+### Where the numbers come from
+
+Every request spends tokens of four kinds:
+
+- **input** (fresh, uncached) — baseline price, 1×
+- **output** — the most expensive tokens, but deliberately excluded from this indicator (it's
+  the actual product of the turn, not a loss)
+- **cache write** — writing into the cache, priced above baseline (~1.25×) — a premium paid so
+  it can be read cheaply later
+- **cache read** — reading from the cache, nearly free (~0.1×) — the entire point of caching
+
+The formula, in plain terms: *how much you saved by reading from cache, minus how much you
+overpaid to write to it, divided by total input volume* — pooled over a rolling window of the
+last 5 turns rather than the whole session, so it stays responsive to what's happening right now.
+
+### Reading the zones
+
+| Zone | Meaning | What's happening | What to do |
+| --- | --- | --- | --- |
+| 🟢 Green, ≥70% | Normal, expected | Cache is being reused heavily; reads are cheap. A settled session typically sits around 80–90% | Nothing — this is healthy |
+| 🟡 Yellow, 0–70% | Transitional | Either a large new file/context was just loaded (cache hasn't warmed up yet) or one recent turn went badly | Watch a couple of turns — if it recovers to green on its own, it was just onboarding new context |
+| 🔴 Red, <0% + `⚠` | Real problem | Over the last ~5 turns you're net *losing* money on caching — paying more for writes than you're saving on reads. This is churn (the cache keeps getting invalidated) | Worth investigating — see below |
+
+One important nuance: a single expensive cache write (e.g. you just fed the model a large file)
+is normal and expected to dip the indicator into yellow for a turn or two — that's not a
+problem. Only worry if it stays **red for several turns in a row** — that's the actual signal
+that the cache isn't sticking.
+
+### What causes sustained churn
+
+Typical causes of persistent churn:
+
+- Jumping between unrelated tasks/files every turn, never letting context settle
+- Something at the start of the prompt changes on every turn (a timestamp, a random ID),
+  breaking the cached prefix
+- Running `/compact` too often — each one resets the cache and forces a re-warm
+
+### Limitations
+
+- **Doesn't track output tokens** — a session with huge model responses will still read green,
+  even if output dominates the bill. That's deliberate (this indicator is about caching, not
+  total spend), but it's easy to mistake green for "everything is cheap."
+- **The 5-turn window is an arbitrary tradeoff** — shorter and it jitters on every small turn;
+  longer and it stops reacting to a current problem. 5 is a reasonable default, not a tuned
+  constant.
+- **Doesn't explain *why* churn happened** — red means "bad," not which file or request
+  pattern broke the cache. Diagnosis is on you.
+- **Depends on hardcoded price multipliers (0.1× / 1.25×).** The formula itself is
+  price-independent (that's a feature), but if Anthropic changes the *structure* of cache
+  discounts (not just the price), those constants need a manual update — they won't pick it up
+  automatically.
+- **State is persisted to disk** (`~/.claude/cc-cache-window-*.json`) — deleting that file
+  mid-session resets the window for a few turns, and the indicator will briefly show "warming up"
+  until it accumulates new data.
+- **An onboarding dip into yellow/red is easy to mistake for a real problem** if you don't know
+  about it in advance (see the zones table above) — which is why `⚠` exists as a distinct strong
+  signal marker rather than just relying on the color transition.
+
+### Note on Plan (Pro/Max) limits
+
+Anthropic's own docs describe Claude Code plan limits (Pro/Max/Team) as compute-based rather
+than message-count-based, and state that prompt caching bills turns after the first at a much
+cheaper cache-read rate. In principle that means efficient cache reuse (this indicator staying
+green) should make the same amount of real work consume *less* of your 5-hour/weekly limit than
+if the cache kept churning (red). The exact token-to-percent-of-limit conversion isn't published,
+though, so treat this indicator as a proxy signal for wasteful spend, not a precise plan-limit
+calculator. **Unverified:** some non-official, third-party reports mention a caching-related bug
+around March 2026 that caused plan limits to burn down far faster than normal for affected users;
+take that specific claim with appropriate skepticism, since it isn't sourced from official
+Anthropic documentation.
 
 ## Verification
 
