@@ -77,91 +77,113 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1') {
 if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     $accountCacheFile = "$env:TEMP\claude-statusline-account-$sessionId.json"
 
+    # NON-BLOCKING: read only whatever identity is already cached. The slow
+    # lookups (claude auth status, public IP) must NOT run on the render path.
+    # Each can take seconds, and Claude Code cancels a status line command
+    # when the next update arrives -- so a slow render is killed before it can
+    # print, and the line then stays blank. A detached, lock-throttled
+    # background process refreshes the cache instead; the values appear on a
+    # later render.
     $cache = $null
     if (Test-Path $accountCacheFile) {
         try { $cache = Get-Content $accountCacheFile -Raw | ConvertFrom-Json } catch {}
     }
-
-    $accountPlan = $cache.plan
+    $accountPlan  = $cache.plan
     $accountEmail = $cache.email
-    $publicIp = $cache.publicIp
-    $cacheDirty = $false
+    $publicIp     = $cache.publicIp
+
+    # The two TTLs stay independent (see README "Configuring refresh
+    # intervals"): accountRefreshSeconds paces `claude auth status`,
+    # ipRefreshSeconds the public-IP fetch. Re-checking periodically rather
+    # than "once ever" also matters for resumed sessions, which reuse their
+    # session_id -- a permanent cache would keep showing a pre-switch account
+    # forever after logging into a different one mid-session.
     $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $accountAge = $nowEpoch - [int64]($cache.accountCheckedAt)
+    $ipAge      = $nowEpoch - [int64]($cache.ipCheckedAt)
+    $accountStale = -not ($accountPlan -and $accountEmail) -or ($accountAge -ge $accountRefreshSeconds)
+    $ipStale      = -not $publicIp -or ($ipAge -ge $ipRefreshSeconds)
 
-    $accountCheckedAt = [int64]($cache.accountCheckedAt)
-    $accountAge = $nowEpoch - $accountCheckedAt
-
-    # Re-check periodically rather than "once ever" -- a resumed session reuses
-    # its session_id, so a permanent cache would keep showing a pre-switch
-    # account forever after logging into a different one mid-session.
-    $accountStillFresh = $accountPlan -and $accountEmail -and ($accountAge -lt $accountRefreshSeconds)
-    if (-not $accountStillFresh) {
-        $cacheDirty = $true
-        $accountCheckedAt = $nowEpoch
+    # Fire-and-forget refresh; the render never waits on it. At most one
+    # refresher runs at a time: skip if a lock is younger than 30s, and mark
+    # the lock in the parent BEFORE spawning so two back-to-back renders
+    # cannot both spawn one.
+    if ($accountStale -or $ipStale) {
+        $lock = "$env:TEMP\claude-statusline-refresh-$sessionId.lock"
+        $lockItem = Get-Item $lock -ErrorAction SilentlyContinue
+        $lockFresh = $lockItem -and (((Get-Date) - $lockItem.LastWriteTime).TotalSeconds -lt 30)
+        if (-not $lockFresh) {
+            Set-Content -LiteralPath $lock -Value '' -ErrorAction SilentlyContinue
+            # Refresher body. Single-quoted here-string: nothing is
+            # interpolated here; the __PLACEHOLDER__ tokens are substituted
+            # below. It renews only the component(s) whose TTL has lapsed
+            # (keeping last-known-good values on failure), writes the cache,
+            # prunes day-old files, then clears the lock.
+            $refreshTemplate = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$cacheFile = '__CACHE__'
+$lock = '__LOCK__'
+$acctTtl = [int64]__ACCT_TTL__
+$ipTtl = [int64]__IP_TTL__
+try {
+    $plan = $null; $email = $null; $publicIp = $null
+    $acctAt = [int64]0; $ipAt = [int64]0
+    if (Test-Path $cacheFile) {
+        try {
+            $o = Get-Content $cacheFile -Raw | ConvertFrom-Json
+            $plan = $o.plan; $email = $o.email; $publicIp = $o.publicIp
+            $acctAt = [int64]($o.accountCheckedAt); $ipAt = [int64]($o.ipCheckedAt)
+        } catch {}
+    }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if (-not ($plan -and $email) -or (($now - $acctAt) -ge $acctTtl)) {
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            # Route through cmd.exe: Process.Start with UseShellExecute=false
-            # does its own CreateProcess lookup, which does not apply PATHEXT
-            # the way a shell does -- a bare FileName="claude" fails to find
-            # claude.cmd shims (nvm/conda installs) even though they're on PATH.
-            $psi.FileName = "cmd.exe"
-            $psi.Arguments = "/c claude auth status --json"
+            # Route through cmd.exe so CreateProcess applies PATHEXT and finds
+            # the claude.cmd shim (npm/nvm installs) that a bare "claude"
+            # would miss.
+            $psi.FileName = 'cmd.exe'
+            $psi.Arguments = '/c claude auth status --json'
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            if ($proc.WaitForExit(3000)) {
-                $auth = $proc.StandardOutput.ReadToEnd() | ConvertFrom-Json
+            $p = [System.Diagnostics.Process]::Start($psi)
+            if ($p.WaitForExit(6000)) {
+                $auth = $p.StandardOutput.ReadToEnd() | ConvertFrom-Json
                 if ($auth.loggedIn) {
-                    $textInfo = (Get-Culture).TextInfo
-                    $accountPlan = $textInfo.ToTitleCase(($auth.subscriptionType -replace '_', ' '))
-                    $accountEmail = $auth.email
+                    $ti = (Get-Culture).TextInfo
+                    $plan = $ti.ToTitleCase(($auth.subscriptionType -replace '_', ' '))
+                    $email = $auth.email
                 } else {
-                    # Genuinely logged out -- don't keep displaying a stale identity.
-                    $accountPlan = $null
-                    $accountEmail = $null
+                    # Genuinely logged out -- do not keep a stale identity.
+                    $plan = $null; $email = $null
                 }
             } else {
-                $proc.Kill()
-                # Timed out -- keep whatever plan/email was already cached
-                # (last known-good) and retry after the next interval.
+                # Timed out -- keep last known-good and retry next interval.
+                try { $p.Kill() } catch {}
             }
         } catch {}
+        $acctAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     }
-
-    # Refresh public IP once the TTL elapses (or if we've never fetched it).
-    # A failed fetch keeps the last known-good IP on screen and still bumps
-    # the timestamp, so we retry after the interval instead of re-stalling on
-    # a broken DNS/network every single render.
-    $ipCheckedAt = [int64]($cache.ipCheckedAt)
-    $ipAge = $nowEpoch - $ipCheckedAt
-    if (-not $publicIp -or $ipAge -ge $ipRefreshSeconds) {
-        $cacheDirty = $true
-        try {
-            $newIp = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 3
-            if ($newIp) { $publicIp = $newIp }
-        } catch {}
-        $ipCheckedAt = $nowEpoch
+    if (-not $publicIp -or (($now - $ipAt) -ge $ipTtl)) {
+        # A failed fetch keeps the last known-good IP and still bumps the
+        # timestamp, so a broken DNS/network is retried after the interval.
+        try { $ip = Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 6; if ($ip) { $publicIp = "$ip".Trim() } } catch {}
+        $ipAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     }
-
-    if ($cacheDirty) {
-        try {
-            @{
-                plan             = $accountPlan
-                email            = $accountEmail
-                publicIp         = $publicIp
-                accountCheckedAt = $accountCheckedAt
-                ipCheckedAt      = $ipCheckedAt
-            } | ConvertTo-Json | Out-File $accountCacheFile -Encoding utf8
-        } catch {}
-
-        # Prune cache files from past sessions so %TEMP% doesn't accumulate them.
-        try {
-            Get-ChildItem "$env:TEMP\claude-statusline-account-*.json" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne "claude-statusline-account-$sessionId.json" -and $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-        } catch {}
+    try { @{ plan = $plan; email = $email; publicIp = $publicIp; accountCheckedAt = $acctAt; ipCheckedAt = $ipAt } | ConvertTo-Json | Set-Content -LiteralPath $cacheFile -Encoding utf8 } catch {}
+    try { Get-ChildItem "$env:TEMP\claude-statusline-account-*.json", "$env:TEMP\claude-statusline-refresh-*.lock" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+} finally {
+    Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+}
+'@
+            $refreshSrc = $refreshTemplate.Replace('__CACHE__', $accountCacheFile).Replace('__LOCK__', $lock).Replace('__ACCT_TTL__', "$accountRefreshSeconds").Replace('__IP_TTL__', "$ipRefreshSeconds")
+            try {
+                $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($refreshSrc))
+                Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc | Out-Null
+            } catch {}
+        }
     }
 }
 

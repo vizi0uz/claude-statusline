@@ -121,6 +121,7 @@ When the flag is on:
 - LAN IP is recomputed on every render (it's a local routing-table lookup, not a network call, so there's no cost to keeping it live)
 - Account plan/email and public IP are fetched and cached per session, each re-checked periodically once its own refresh interval elapses (see below) — this is what lets the display catch up if you switch accounts or your public IP changes mid-session, instead of showing whatever was true the first time this session rendered
 - If a refresh fails (e.g. a DNS hiccup for the public IP, or `claude auth status` failing/timing out), the last known-good value stays on screen instead of going blank, and it's retried after the interval — not stuck until the cache expires a day later. The one exception: if `claude auth status` succeeds and reports you're logged out, plan/email are cleared immediately rather than kept stale.
+- The slow lookups (`claude auth status` and the public-IP fetch) never run on the render path: a detached background process refreshes the per-session cache and the render only reads it. Claude Code cancels an in-flight status line command when the next update arrives, so a render that waited on those calls could be killed before printing — leaving the line blank. The trade-off: a fresh session's first render shows the line without plan/email/public IP, and they appear on a later render a few seconds after launch. Tip: setting `statusLine.refreshInterval` in `settings.json` makes Claude Code re-run the script every N seconds, so the freshly cached identity shows up promptly even while you're idle.
 
 ## Configuring refresh intervals
 
@@ -149,7 +150,7 @@ Note on resumed sessions: `claude --resume <id>` reuses the original session's c
 ## Dependencies
 
 ### Windows
-- PowerShell 6+ (pwsh)
+- PowerShell — either Windows PowerShell 5.1 (preinstalled) or PowerShell 6+ (pwsh). The script source is pure ASCII and parses and renders identically under both.
 
 ### Linux / macOS
 - bash

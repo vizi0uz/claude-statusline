@@ -65,76 +65,98 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]]; then
 fi
 
 if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; then
+    # NON-BLOCKING: read only whatever identity is already cached. The slow
+    # lookups (claude auth status, public IP) must NOT run on the render path.
+    # Each can take seconds, and Claude Code cancels a status line command
+    # when the next update arrives -- so a slow render is killed before it can
+    # print, and the line then stays blank. A detached, lock-throttled
+    # background process refreshes the cache instead; the values appear on a
+    # later render.
     cache=""
     if [[ -f "$cache_file" ]]; then
         cache=$(cat "$cache_file" 2>/dev/null)
     fi
-
     account_plan=$(echo "$cache" | jq -r '.plan // empty' 2>/dev/null)
     account_email=$(echo "$cache" | jq -r '.email // empty' 2>/dev/null)
+    public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
     account_checked_at=$(echo "$cache" | jq -r '.accountCheckedAt // 0' 2>/dev/null)
     [[ "$account_checked_at" =~ ^[0-9]+$ ]] || account_checked_at=0
-    public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
     ip_checked_at=$(echo "$cache" | jq -r '.ipCheckedAt // 0' 2>/dev/null)
     [[ "$ip_checked_at" =~ ^[0-9]+$ ]] || ip_checked_at=0
 
-    cache_dirty=0
+    # The two TTLs stay independent (see README "Configuring refresh
+    # intervals"): account_refresh_seconds paces `claude auth status`,
+    # ip_refresh_seconds the public-IP fetch. Re-checking periodically rather
+    # than "once ever" also matters for resumed sessions, which reuse their
+    # session_id -- a permanent cache would keep showing a pre-switch account
+    # forever after logging into a different one mid-session.
     now_epoch=$(date +%s)
     account_age=$(( now_epoch - account_checked_at ))
-
-    # Re-check periodically rather than "once ever" — a resumed session reuses
-    # its session_id, so a permanent cache would keep showing a pre-switch
-    # account forever after logging into a different one mid-session.
-    if [[ -z "$account_plan" || -z "$account_email" || $account_age -ge $account_refresh_seconds ]]; then
-        cache_dirty=1
-        account_checked_at=$now_epoch
-        auth_output=$(timeout 3 claude auth status --json 2>/dev/null)
-        if [[ $? -eq 0 ]]; then
-            logged_in=$(echo "$auth_output" | jq -r '.loggedIn // false' 2>/dev/null)
-            if [[ "$logged_in" == "true" ]]; then
-                sub_type=$(echo "$auth_output" | jq -r '.subscriptionType // empty' 2>/dev/null)
-                # Convert subscription type: replace _ with space and title-case
-                if [[ -n "$sub_type" ]]; then
-                    account_plan=$(echo "$sub_type" | sed 's/_/ /g' | sed 's/\b\(.\)/\u\1/g')
-                fi
-                account_email=$(echo "$auth_output" | jq -r '.email // empty' 2>/dev/null)
-            else
-                # Genuinely logged out — don't keep displaying a stale identity.
-                account_plan=""
-                account_email=""
-            fi
-        fi
-        # else: the call failed/timed out — keep whatever plan/email was
-        # already cached (last known-good, same behavior as the IP fetch
-        # below) and retry after the next interval instead of every render.
-    fi
-
-    # Refresh public IP once the TTL elapses (or if we've never fetched it).
-    # A failed fetch (e.g. DNS timeout) keeps the last known-good IP on screen
-    # and still bumps the timestamp, so we retry after the interval instead of
-    # re-stalling on a broken resolver every single render.
     ip_age=$(( now_epoch - ip_checked_at ))
-    if [[ -z "$public_ip" || $ip_age -ge $ip_refresh_seconds ]]; then
-        new_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null)
-        [[ -n "$new_ip" ]] && public_ip="$new_ip"
-        ip_checked_at=$now_epoch
-        cache_dirty=1
-    fi
+    account_stale=0
+    [[ -z "$account_plan" || -z "$account_email" || $account_age -ge $account_refresh_seconds ]] && account_stale=1
+    ip_stale=0
+    [[ -z "$public_ip" || $ip_age -ge $ip_refresh_seconds ]] && ip_stale=1
 
-    # Write cache if it was updated
-    if [[ $cache_dirty -eq 1 ]]; then
-        write_cache=$(jq -n \
-            --arg plan "$account_plan" \
-            --arg email "$account_email" \
-            --arg ip "$public_ip" \
-            --argjson checkedAt "$ip_checked_at" \
-            --argjson acctCheckedAt "$account_checked_at" \
-            '{plan: $plan, email: $email, publicIp: $ip, accountCheckedAt: $acctCheckedAt, ipCheckedAt: $checkedAt}')
-        echo "$write_cache" > "$cache_file" 2>/dev/null
+    # Fire-and-forget refresh; the render never waits on it. At most one
+    # refresher runs at a time: skip if a lock is younger than 30s, and mark
+    # the lock in the parent BEFORE spawning so two back-to-back renders
+    # cannot both spawn one.
+    if [[ $account_stale -eq 1 || $ip_stale -eq 1 ]]; then
+        lock="$cache_dir/claude-statusline-refresh-$session_id.lock"
+        lock_fresh=0
+        if [[ -f "$lock" ]]; then
+            lock_mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo 0)
+            [[ $(( now_epoch - lock_mtime )) -lt 30 ]] && lock_fresh=1
+        fi
+        if [[ $lock_fresh -eq 0 ]]; then
+            : > "$lock" 2>/dev/null
+            # Detached refresher: renews only the component(s) whose TTL has
+            # lapsed (keeping last-known-good values on failure), writes the
+            # cache, prunes day-old files, then clears the lock. Paths and
+            # TTLs are passed as positional args.
+            nohup bash -c '
+                cf="$1"; lk="$2"; cdir="$3"; acct_ttl="$4"; ip_ttl="$5"
+                plan=""; email=""; ip=""; acct_at=0; ip_at=0
+                if [[ -f "$cf" ]]; then
+                    old=$(cat "$cf" 2>/dev/null)
+                    plan=$(echo "$old" | jq -r ".plan // empty" 2>/dev/null)
+                    email=$(echo "$old" | jq -r ".email // empty" 2>/dev/null)
+                    ip=$(echo "$old" | jq -r ".publicIp // empty" 2>/dev/null)
+                    acct_at=$(echo "$old" | jq -r ".accountCheckedAt // 0" 2>/dev/null)
+                    [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
+                    ip_at=$(echo "$old" | jq -r ".ipCheckedAt // 0" 2>/dev/null)
+                    [[ "$ip_at" =~ ^[0-9]+$ ]] || ip_at=0
+                fi
+                now=$(date +%s)
+                if [[ -z "$plan" || -z "$email" || $(( now - acct_at )) -ge $acct_ttl ]]; then
+                    auth=$(timeout 6 claude auth status --json 2>/dev/null)
+                    if [[ $? -eq 0 ]]; then
+                        if [[ "$(echo "$auth" | jq -r ".loggedIn // false" 2>/dev/null)" == "true" ]]; then
+                            st=$(echo "$auth" | jq -r ".subscriptionType // empty" 2>/dev/null)
+                            [[ -n "$st" ]] && plan=$(echo "$st" | sed "s/_/ /g" | sed "s/\b\(.\)/\u\1/g")
+                            email=$(echo "$auth" | jq -r ".email // empty" 2>/dev/null)
+                        else
+                            plan=""; email=""
+                        fi
+                    fi
+                    acct_at=$(date +%s)
+                fi
+                if [[ -z "$ip" || $(( now - ip_at )) -ge $ip_ttl ]]; then
+                    new_ip=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null)
+                    [[ -n "$new_ip" ]] && ip="$new_ip"
+                    ip_at=$(date +%s)
+                fi
+                jq -n --arg plan "$plan" --arg email "$email" --arg ip "$ip" \
+                    --argjson acctAt "$acct_at" --argjson ipAt "$ip_at" \
+                    "{plan: \$plan, email: \$email, publicIp: \$ip, accountCheckedAt: \$acctAt, ipCheckedAt: \$ipAt}" > "$cf" 2>/dev/null
+                find "$cdir" -name "claude-statusline-account-*.json" -type f -mtime +1 -delete 2>/dev/null
+                find "$cdir" -name "claude-statusline-refresh-*.lock" -type f -mtime +1 -delete 2>/dev/null
+                rm -f "$lk" 2>/dev/null
+            ' _ "$cache_file" "$lock" "$cache_dir" "$account_refresh_seconds" "$ip_refresh_seconds" >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
     fi
-
-    # Prune cache files older than 1 day
-    find "$cache_dir" -name "claude-statusline-account-*.json" -type f -mtime +1 ! -name "claude-statusline-account-$session_id.json" -delete 2>/dev/null
 fi
 
 # ---- Cache-efficiency indicator ----
