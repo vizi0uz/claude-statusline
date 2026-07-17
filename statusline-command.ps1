@@ -91,7 +91,7 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     $accountCheckedAt = [int64]($cache.accountCheckedAt)
     $accountAge = $nowEpoch - $accountCheckedAt
 
-    # Re-check periodically rather than "once ever" — a resumed session reuses
+    # Re-check periodically rather than "once ever" -- a resumed session reuses
     # its session_id, so a permanent cache would keep showing a pre-switch
     # account forever after logging into a different one mid-session.
     $accountStillFresh = $accountPlan -and $accountEmail -and ($accountAge -lt $accountRefreshSeconds)
@@ -102,7 +102,7 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             # Route through cmd.exe: Process.Start with UseShellExecute=false
             # does its own CreateProcess lookup, which does not apply PATHEXT
-            # the way a shell does — a bare FileName="claude" fails to find
+            # the way a shell does -- a bare FileName="claude" fails to find
             # claude.cmd shims (nvm/conda installs) even though they're on PATH.
             $psi.FileName = "cmd.exe"
             $psi.Arguments = "/c claude auth status --json"
@@ -118,13 +118,13 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
                     $accountPlan = $textInfo.ToTitleCase(($auth.subscriptionType -replace '_', ' '))
                     $accountEmail = $auth.email
                 } else {
-                    # Genuinely logged out — don't keep displaying a stale identity.
+                    # Genuinely logged out -- don't keep displaying a stale identity.
                     $accountPlan = $null
                     $accountEmail = $null
                 }
             } else {
                 $proc.Kill()
-                # Timed out — keep whatever plan/email was already cached
+                # Timed out -- keep whatever plan/email was already cached
                 # (last known-good) and retry after the next interval.
             }
         } catch {}
@@ -165,15 +165,27 @@ if ($env:CLAUDE_STATUSLINE_SHOW_IDENTITY -eq '1' -and $sessionId) {
     }
 }
 
-$cyan    = "`e[36m"
-$gray    = "`e[90m"
-$blue    = "`e[94m"
-$green   = "`e[32m"
-$yellow  = "`e[33m"
-$red     = "`e[31m"
-$magenta   = "`e[95m"
-$boldWhite = "`e[1;97m"
-$reset     = "`e[0m"
+# ESC and the bar glyphs are built from code points so the script is pure
+# ASCII and parses + renders identically under Windows PowerShell 5.1 and 7,
+# regardless of the file's on-disk encoding. (`e is a PS 6+ escape, and a
+# non-ASCII glyph literal makes the 5.1 parser choke when the .ps1 is read
+# with the system ANSI code page instead of UTF-8.)
+$ESC       = [char]27
+$BAR_FULL  = [string][char]0x2588   # full block   (session bar, filled)
+$BAR_EMPTY = [string][char]0x2591   # light shade  (bar remainder)
+$BAR_CACHE = [string][char]0x2593   # medium shade (cache bar)
+$SEP       = [char]0x00B7           # middot separator
+$WARN      = [char]0x26A0           # warning sign
+
+$cyan    = "${ESC}[36m"
+$gray    = "${ESC}[90m"
+$blue    = "${ESC}[94m"
+$green   = "${ESC}[32m"
+$yellow  = "${ESC}[33m"
+$red     = "${ESC}[31m"
+$magenta   = "${ESC}[95m"
+$boldWhite = "${ESC}[1;97m"
+$reset     = "${ESC}[0m"
 
 # ---- Cache-efficiency indicator ----
 # Price-weighted cache-savings ratio, pooled over the last N turns:
@@ -207,7 +219,7 @@ if (Test-Path $cacheStateFile) {
 if (-not $cacheState) {
     $cacheState = [PSCustomObject]@{ last_cost = $null; turns = @() }
 }
-# ConvertFrom-Json collapses a one-element JSON array to a single object, not an array — force it back.
+# ConvertFrom-Json collapses a one-element JSON array to a single object, not an array -- force it back.
 $cacheTurns = @($cacheState.turns)
 
 # Turn-boundary detection: a new billed API call changes total_cost_usd, and current_usage
@@ -232,7 +244,7 @@ if ($null -ne $cacheCurrentUsage -and $null -ne $cost -and $cost -ne $cacheState
         Move-Item -Force $cacheTmpFile $cacheStateFile
     } catch {}
 
-    # Prune cache-window files older than 1 day — gated to at most once per day via a marker
+    # Prune cache-window files older than 1 day -- gated to at most once per day via a marker
     # file. A turn boundary can hit multiple times per session, and a wildcard directory scan
     # over a busy temp dir (e.g. antivirus scanning each entry) can cost multiple seconds; a
     # per-write scan would make that tax recur on every single turn.
@@ -261,12 +273,12 @@ foreach ($cacheTurn in $cacheTurns) {
 $cacheDenom = $cachePoolF + $cachePoolW + $cachePoolR
 
 # ctx% stage framework (truecolor, thresholds from the Opus staging table)
-$ctxStage1 = "`e[38;2;34;197;94m"    # 0-30%   Green    #22c55e  Optimal
-$ctxStage2 = "`e[38;2;20;184;166m"   # 30-50%  Teal     #14b8a6  Healthy
-$ctxStage3 = "`e[38;2;234;179;8m"    # 50-60%  Yellow   #eab308  Watch
-$ctxStage4 = "`e[38;2;249;115;22m"   # 60-75%  Orange   #f97316  Handoff zone
-$ctxStage5 = "`e[38;2;239;68;68m"    # 75-83%  Red      #ef4444  Danger
-$ctxStage6 = "`e[38;2;153;27;27m"    # 83%+    Dark red #991b1b  Critical/lossy
+$ctxStage1 = "${ESC}[38;2;34;197;94m"    # 0-30%   Green    #22c55e  Optimal
+$ctxStage2 = "${ESC}[38;2;20;184;166m"   # 30-50%  Teal     #14b8a6  Healthy
+$ctxStage3 = "${ESC}[38;2;234;179;8m"    # 50-60%  Yellow   #eab308  Watch
+$ctxStage4 = "${ESC}[38;2;249;115;22m"   # 60-75%  Orange   #f97316  Handoff zone
+$ctxStage5 = "${ESC}[38;2;239;68;68m"    # 75-83%  Red      #ef4444  Danger
+$ctxStage6 = "${ESC}[38;2;153;27;27m"    # 83%+    Dark red #991b1b  Critical/lossy
 
 $line = ""
 
@@ -293,7 +305,7 @@ if ($null -ne $used) {
 }
 
 if ($accountPlan -or $accountEmail) {
-    $line = "$line  ${green}${accountPlan}${reset} ${gray}·${reset} ${cyan}${accountEmail}${reset}"
+    $line = "$line  ${green}${accountPlan}${reset} ${gray}${SEP}${reset} ${cyan}${accountEmail}${reset}"
 }
 
 $hostname = $env:COMPUTERNAME
@@ -317,7 +329,7 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     $filled = [int][math]::Round(($pct / 100) * $barWidth)
     if ($filled -gt $barWidth) { $filled = $barWidth }
     if ($filled -lt 0) { $filled = 0 }
-    $bar = ('█' * $filled) + ('░' * ($barWidth - $filled))
+    $bar = ($BAR_FULL * $filled) + ($BAR_EMPTY * ($barWidth - $filled))
 
     # Same 6-stage gradient as ctx% (warmer as the session fills)
     $barColor = if ($pct -ge 83) { $ctxStage6 } elseif ($pct -ge 75) { $ctxStage5 } elseif ($pct -ge 60) { $ctxStage4 } elseif ($pct -ge 50) { $ctxStage3 } elseif ($pct -ge 30) { $ctxStage2 } else { $ctxStage1 }
@@ -333,17 +345,17 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
     $resetStr = if ($hours -gt 0) { "${hours}h ${minutes}m" } else { "${minutes}m" }
 
     # resets_at has passed, but Claude Code only refreshes rate_limits on the
-    # next API call, so pct above may be a stale snapshot too — flag it rather
+    # next API call, so pct above may be a stale snapshot too -- flag it rather
     # than show a countdown frozen at 0m.
     $sessionLine = if ($stale) {
-        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}· awaiting refresh${reset}"
+        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}${SEP} awaiting refresh${reset}"
     } else {
-        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}·${reset} resets in ${resetStr}"
+        "${gray}Session ${reset}${barColor}${bar}${reset} ${pct}% used ${gray}${SEP}${reset} resets in ${resetStr}"
     }
 
     # Cache-efficiency segment, appended after the Session bar on the same line.
     if ($cacheDenom -eq 0) {
-        $cacheSegment = "  ${gray}·${reset}  ${gray}cache ······ warming up${reset}"
+        $cacheSegment = "  ${gray}${SEP}${reset}  ${gray}cache ${SEP}${SEP}${SEP}${SEP}${SEP}${SEP} warming up${reset}"
     } else {
         $cacheSavings = ((1 - $cacheWRead) * $cachePoolR - ($cacheWWrite - 1) * $cachePoolW) / $cacheDenom
 
@@ -355,20 +367,20 @@ if ($fiveHour -and $null -ne $fiveHour.used_percentage -and $null -ne $fiveHour.
         if ($cacheClamped -lt 0) { $cacheClamped = 0 }
         if ($cacheClamped -gt $cacheCeil) { $cacheClamped = $cacheCeil }
         $cacheFill = [int][math]::Round($cacheClamped / $cacheCeil * $cacheBarCells)
-        $cacheBar = ('▓' * $cacheFill) + ('░' * ($cacheBarCells - $cacheFill))
+        $cacheBar = ($BAR_CACHE * $cacheFill) + ($BAR_EMPTY * ($cacheBarCells - $cacheFill))
 
         $cacheWarn = ""
-        if ($cacheSavings -lt 0) { $cacheWarn = " ${red}⚠${reset}" }
+        if ($cacheSavings -lt 0) { $cacheWarn = " ${red}${WARN}${reset}" }
 
         $cachePct = [int][math]::Round($cacheSavings * 100)
 
         $cacheCostStr = ""
         if ($null -ne $cost) {
             $cacheCostFmt = $cost.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
-            $cacheCostStr = "  ${gray}·${reset}  " + '$' + $cacheCostFmt
+            $cacheCostStr = "  ${gray}${SEP}${reset}  " + '$' + $cacheCostFmt
         }
 
-        $cacheSegment = "  ${gray}·${reset}  ${gray}cache${reset} ${cacheColor}${cacheBar} ${cachePct}%${reset}${cacheWarn}${cacheCostStr}"
+        $cacheSegment = "  ${gray}${SEP}${reset}  ${gray}cache${reset} ${cacheColor}${cacheBar} ${cachePct}%${reset}${cacheWarn}${cacheCostStr}"
     }
     $sessionLine = "$sessionLine$cacheSegment"
 
