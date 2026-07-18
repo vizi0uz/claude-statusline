@@ -172,6 +172,10 @@ cache_green_at=0.70    # savings >= this -> green
 cache_bar_cells=10
 
 cost=$(echo "$json" | jq -r '.cost.total_cost_usd // empty')
+# prompt_id is the current user prompt's UUID (Claude Code v2.1.196+). It's the
+# turn-boundary signal that stays reliable when cost is absent/frozen. Empty on
+# older Claude Code -- then detection falls back to cost alone (behavior as before).
+prompt_id=$(echo "$json" | jq -r '.prompt_id // empty')
 cu_present=$(echo "$json" | jq -r 'if .context_window.current_usage == null then "0" else "1" end')
 cu_f=$(echo "$json" | jq -r '.context_window.current_usage.input_tokens // 0')
 cu_w=$(echo "$json" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
@@ -186,18 +190,29 @@ if [[ -f "$cache_state_file" ]]; then
     cache_state=$(cat "$cache_state_file" 2>/dev/null)
 fi
 if ! echo "$cache_state" | jq -e '.turns | type == "array"' >/dev/null 2>&1; then
-    cache_state='{"last_cost":null,"turns":[]}'
+    cache_state='{"last_cost":null,"last_prompt_id":null,"turns":[]}'
 fi
 
 last_cost=$(echo "$cache_state" | jq -r '.last_cost // empty')
+last_prompt_id=$(echo "$cache_state" | jq -r '.last_prompt_id // empty')
 
-# Turn-boundary detection: a new billed API call changes total_cost_usd, and current_usage
-# holds that same call's composition. Log once per call, not once per render.
-if [[ "$cu_present" == "1" ]] && [[ -n "$cost" ]] && [[ "$cost" != "$last_cost" ]]; then
+# Turn-boundary detection (compound OR): a new billed API call changes total_cost_usd
+# (per-call granularity), and a new user prompt changes prompt_id -- either one marks a
+# fresh current_usage snapshot worth logging. The prompt_id arm keeps the indicator alive
+# when cost is null/frozen; the cost arm preserves per-call resolution and works on Claude
+# Code older than v2.1.196 (no prompt_id). Both last_* update in the same state write, so a
+# turn where both change logs exactly once. current_usage must be present either way.
+cost_changed=0
+[[ -n "$cost" && "$cost" != "$last_cost" ]] && cost_changed=1
+prompt_changed=0
+[[ -n "$prompt_id" && "$prompt_id" != "$last_prompt_id" ]] && prompt_changed=1
+if [[ "$cu_present" == "1" ]] && { [[ $cost_changed -eq 1 ]] || [[ $prompt_changed -eq 1 ]]; }; then
+    # cost may be empty (the prompt_id-only case) -- pass JSON null so --argjson stays valid.
+    cost_json="${cost:-null}"
     cache_state=$(echo "$cache_state" | jq \
         --argjson f "$cu_f" --argjson w "$cu_w" --argjson r "$cu_r" \
-        --argjson cost "$cost" --argjson n "$cache_n" \
-        '.turns += [{"F":$f,"W":$w,"R":$r}] | .turns = (.turns[-$n:]) | .last_cost = $cost')
+        --argjson cost "$cost_json" --arg pid "$prompt_id" --argjson n "$cache_n" \
+        '.turns += [{"F":$f,"W":$w,"R":$r}] | .turns = (.turns[-$n:]) | .last_cost = $cost | .last_prompt_id = $pid')
     cache_tmp_file="$cache_state_file.tmp.$$"
     echo "$cache_state" > "$cache_tmp_file" 2>/dev/null && mv -f "$cache_tmp_file" "$cache_state_file" 2>/dev/null
 

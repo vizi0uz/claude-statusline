@@ -224,6 +224,10 @@ $cacheCeil     = 1.0 - $cacheWRead
 
 $cost = $data.cost.total_cost_usd
 $cacheCurrentUsage = $data.context_window.current_usage
+# prompt_id is the current user prompt's UUID (Claude Code v2.1.196+). It's the
+# turn-boundary signal that stays reliable when cost is absent/frozen. Empty on
+# older Claude Code -- then detection falls back to cost alone (behavior as before).
+$promptId = $data.prompt_id
 
 $cacheSid = ($sessionId -replace '[^a-zA-Z0-9_-]', '')
 if (-not $cacheSid) { $cacheSid = "default" }
@@ -239,14 +243,20 @@ if (Test-Path $cacheStateFile) {
     } catch {}
 }
 if (-not $cacheState) {
-    $cacheState = [PSCustomObject]@{ last_cost = $null; turns = @() }
+    $cacheState = [PSCustomObject]@{ last_cost = $null; last_prompt_id = $null; turns = @() }
 }
 # ConvertFrom-Json collapses a one-element JSON array to a single object, not an array -- force it back.
 $cacheTurns = @($cacheState.turns)
 
-# Turn-boundary detection: a new billed API call changes total_cost_usd, and current_usage
-# holds that same call's composition. Log once per call, not once per render.
-if ($null -ne $cacheCurrentUsage -and $null -ne $cost -and $cost -ne $cacheState.last_cost) {
+# Turn-boundary detection (compound OR): a new billed API call changes total_cost_usd
+# (per-call granularity), and a new user prompt changes prompt_id -- either one marks a
+# fresh current_usage snapshot worth logging. The prompt_id arm keeps the indicator alive
+# when cost is null/frozen; the cost arm preserves per-call resolution and works on Claude
+# Code older than v2.1.196 (no prompt_id). Both last_* update in the same state write, so a
+# turn where both change logs exactly once. current_usage must be present either way.
+$costChanged   = ($null -ne $cost) -and ($cost -ne $cacheState.last_cost)
+$promptChanged = $promptId -and ($promptId -ne $cacheState.last_prompt_id)
+if ($null -ne $cacheCurrentUsage -and ($costChanged -or $promptChanged)) {
     $cacheF = $cacheCurrentUsage.input_tokens
     if ($null -eq $cacheF) { $cacheF = 0 }
     $cacheWTok = $cacheCurrentUsage.cache_creation_input_tokens
@@ -260,7 +270,7 @@ if ($null -ne $cacheCurrentUsage -and $null -ne $cost -and $cost -ne $cacheState
     }
 
     try {
-        $newCacheState = [PSCustomObject]@{ last_cost = $cost; turns = $cacheTurns }
+        $newCacheState = [PSCustomObject]@{ last_cost = $cost; last_prompt_id = $promptId; turns = $cacheTurns }
         $cacheTmpFile = "$cacheStateFile.tmp"
         $newCacheState | ConvertTo-Json -Depth 5 | Out-File $cacheTmpFile -Encoding utf8
         Move-Item -Force $cacheTmpFile $cacheStateFile
