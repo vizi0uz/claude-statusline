@@ -3,38 +3,56 @@
 # Read JSON from stdin
 json=$(cat)
 
-# Parse using jq
-model=$(echo "$json" | jq -r '.model.display_name // empty')
-effort=$(echo "$json" | jq -r '.effort.level // empty')
-used=$(echo "$json" | jq -r '.context_window.used_percentage // empty')
-session_id=$(echo "$json" | jq -r '.session_id // empty')
-rate_used=$(echo "$json" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-rate_resets=$(echo "$json" | jq -r '.rate_limits.five_hour.resets_at // empty')
+# Field separator for packing multiple jq outputs into one read. Deliberately a
+# non-whitespace byte: with IFS set to a whitespace character, bash collapses
+# runs of it into a single delimiter, so empty middle fields would shift every
+# later variable by one.
+US=$'\x1f'
+
+# Single parse of the payload. Each `jq` invocation costs a process spawn, and
+# spawning dominates the render cost -- pulling ~15 fields one at a time was the
+# bulk of this script's runtime.
+IFS="$US" read -r model effort used session_id rate_used rate_resets \
+    cost prompt_id cu_present cu_f cu_w cu_r <<< "$(printf '%s' "$json" | jq -r '
+    [ (.model.display_name // ""),
+      (.effort.level // ""),
+      (.context_window.used_percentage // ""),
+      (.session_id // ""),
+      (.rate_limits.five_hour.used_percentage // ""),
+      (.rate_limits.five_hour.resets_at // ""),
+      (.cost.total_cost_usd // ""),
+      (.prompt_id // ""),
+      (if .context_window.current_usage == null then "0" else "1" end),
+      (.context_window.current_usage.input_tokens // 0),
+      (.context_window.current_usage.cache_creation_input_tokens // 0),
+      (.context_window.current_usage.cache_read_input_tokens // 0)
+    ] | map(tostring) | join("")' 2>/dev/null)"
 
 account_plan=""
 account_email=""
 public_ip=""
 lan_ip=""
 
-# Cache directory and file
+# Cache directory and files. session_id reaches us from the payload and is
+# interpolated into paths, so it is sanitised once here and that sanitised form
+# is the only one used below.
 cache_dir="${TMPDIR:-/tmp}"
-cache_file="$cache_dir/claude-statusline-account-$session_id.json"
+safe_sid=$(printf '%s' "$session_id" | tr -cd 'a-zA-Z0-9_-')
+[[ -z "$safe_sid" ]] && safe_sid="default"
+cache_file="$cache_dir/claude-statusline-account-$safe_sid.json"
 config_file="$HOME/.claude/statusline-config.json"
 
-# IP refresh interval (seconds): env var > ~/.claude/statusline-config.json > default
+# Refresh intervals (seconds): env var > ~/.claude/statusline-config.json > default.
 ip_refresh_seconds="$CLAUDE_STATUSLINE_IP_REFRESH_SECONDS"
-if [[ -z "$ip_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
-    ip_refresh_seconds=$(jq -r '.ipRefreshSeconds // empty' "$config_file" 2>/dev/null)
+account_refresh_seconds="$CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS"
+if [[ -z "$ip_refresh_seconds" || -z "$account_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
+    IFS="$US" read -r cfg_ip cfg_account <<< "$(jq -r '
+        [(.ipRefreshSeconds // ""), (.accountRefreshSeconds // "")]
+        | map(tostring) | join("")' "$config_file" 2>/dev/null)"
+    [[ -z "$ip_refresh_seconds" ]] && ip_refresh_seconds="$cfg_ip"
+    [[ -z "$account_refresh_seconds" ]] && account_refresh_seconds="$cfg_account"
 fi
 [[ "$ip_refresh_seconds" =~ ^[0-9]+$ ]] || ip_refresh_seconds=60
-
-# Account info refresh interval (seconds): env var > ~/.claude/statusline-config.json > default.
-# Unlike the IP check, this re-check spawns `claude auth status`, so the
-# default mirrors ip_refresh_seconds rather than being shorter.
-account_refresh_seconds="$CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS"
-if [[ -z "$account_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
-    account_refresh_seconds=$(jq -r '.accountRefreshSeconds // empty' "$config_file" 2>/dev/null)
-fi
 [[ "$account_refresh_seconds" =~ ^[0-9]+$ ]] || account_refresh_seconds=60
 
 # Best-effort LAN IP: ask the OS which local address it would route outbound
@@ -72,16 +90,14 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
     # print, and the line then stays blank. A detached, lock-throttled
     # background process refreshes the cache instead; the values appear on a
     # later render.
-    cache=""
     if [[ -f "$cache_file" ]]; then
-        cache=$(cat "$cache_file" 2>/dev/null)
+        IFS="$US" read -r account_plan account_email public_ip account_checked_at ip_checked_at \
+            <<< "$(jq -r '
+                [(.plan // ""), (.email // ""), (.publicIp // ""),
+                 (.accountCheckedAt // 0), (.ipCheckedAt // 0)]
+                | map(tostring) | join("")' "$cache_file" 2>/dev/null)"
     fi
-    account_plan=$(echo "$cache" | jq -r '.plan // empty' 2>/dev/null)
-    account_email=$(echo "$cache" | jq -r '.email // empty' 2>/dev/null)
-    public_ip=$(echo "$cache" | jq -r '.publicIp // empty' 2>/dev/null)
-    account_checked_at=$(echo "$cache" | jq -r '.accountCheckedAt // 0' 2>/dev/null)
     [[ "$account_checked_at" =~ ^[0-9]+$ ]] || account_checked_at=0
-    ip_checked_at=$(echo "$cache" | jq -r '.ipCheckedAt // 0' 2>/dev/null)
     [[ "$ip_checked_at" =~ ^[0-9]+$ ]] || ip_checked_at=0
 
     # The two TTLs stay independent (see README "Configuring refresh
@@ -103,7 +119,7 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
     # the lock in the parent BEFORE spawning so two back-to-back renders
     # cannot both spawn one.
     if [[ $account_stale -eq 1 || $ip_stale -eq 1 ]]; then
-        lock="$cache_dir/claude-statusline-refresh-$session_id.lock"
+        lock="$cache_dir/claude-statusline-refresh-$safe_sid.lock"
         lock_fresh=0
         if [[ -f "$lock" ]]; then
             lock_mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo 0)
@@ -119,23 +135,26 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
                 cf="$1"; lk="$2"; cdir="$3"; acct_ttl="$4"; ip_ttl="$5"
                 plan=""; email=""; ip=""; acct_at=0; ip_at=0
                 if [[ -f "$cf" ]]; then
-                    old=$(cat "$cf" 2>/dev/null)
-                    plan=$(echo "$old" | jq -r ".plan // empty" 2>/dev/null)
-                    email=$(echo "$old" | jq -r ".email // empty" 2>/dev/null)
-                    ip=$(echo "$old" | jq -r ".publicIp // empty" 2>/dev/null)
-                    acct_at=$(echo "$old" | jq -r ".accountCheckedAt // 0" 2>/dev/null)
+                    IFS=$'"'"'\x1f'"'"' read -r plan email ip acct_at ip_at <<< "$(jq -r "
+                        [(.plan // \"\"), (.email // \"\"), (.publicIp // \"\"),
+                         (.accountCheckedAt // 0), (.ipCheckedAt // 0)]
+                        | map(tostring) | join(\"\")" "$cf" 2>/dev/null)"
                     [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
-                    ip_at=$(echo "$old" | jq -r ".ipCheckedAt // 0" 2>/dev/null)
                     [[ "$ip_at" =~ ^[0-9]+$ ]] || ip_at=0
                 fi
                 now=$(date +%s)
                 if [[ -z "$plan" || -z "$email" || $(( now - acct_at )) -ge $acct_ttl ]]; then
-                    auth=$(timeout 6 claude auth status --json 2>/dev/null)
-                    if [[ $? -eq 0 ]]; then
-                        if [[ "$(echo "$auth" | jq -r ".loggedIn // false" 2>/dev/null)" == "true" ]]; then
-                            st=$(echo "$auth" | jq -r ".subscriptionType // empty" 2>/dev/null)
-                            [[ -n "$st" ]] && plan=$(echo "$st" | sed "s/_/ /g" | sed "s/\b\(.\)/\u\1/g")
-                            email=$(echo "$auth" | jq -r ".email // empty" 2>/dev/null)
+                    if auth=$(timeout 6 claude auth status --json 2>/dev/null); then
+                        if [[ "$(printf "%s" "$auth" | jq -r ".loggedIn // false" 2>/dev/null)" == "true" ]]; then
+                            IFS=$'"'"'\x1f'"'"' read -r st email <<< "$(printf "%s" "$auth" | jq -r "
+                                [(.subscriptionType // \"\"), (.email // \"\")]
+                                | join(\"\")" 2>/dev/null)"
+                            # Title-case in bash rather than `sed s/\b\(.\)/\u\1/`:
+                            # \b and \u are GNU extensions and emit literal junk
+                            # under BSD sed (macOS).
+                            plan=""
+                            for word in ${st//_/ }; do plan="$plan ${word^}"; done
+                            plan="${plan# }"
                         else
                             plan=""; email=""
                         fi
@@ -171,30 +190,23 @@ cache_n=5              # rolling window length, in turns
 cache_green_at=0.70    # savings >= this -> green
 cache_bar_cells=10
 
-cost=$(echo "$json" | jq -r '.cost.total_cost_usd // empty')
-# prompt_id is the current user prompt's UUID (Claude Code v2.1.196+). It's the
-# turn-boundary signal that stays reliable when cost is absent/frozen. Empty on
-# older Claude Code -- then detection falls back to cost alone (behavior as before).
-prompt_id=$(echo "$json" | jq -r '.prompt_id // empty')
-cu_present=$(echo "$json" | jq -r 'if .context_window.current_usage == null then "0" else "1" end')
-cu_f=$(echo "$json" | jq -r '.context_window.current_usage.input_tokens // 0')
-cu_w=$(echo "$json" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-cu_r=$(echo "$json" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+cache_state_file="$cache_dir/claude-statusline-cache-$safe_sid.json"
 
-cache_sid=$(echo "$session_id" | tr -cd 'a-zA-Z0-9_-')
-[[ -z "$cache_sid" ]] && cache_sid="default"
-cache_state_file="$cache_dir/claude-statusline-cache-$cache_sid.json"
-
+# Validate the state file and pull both turn-boundary markers in one pass. An
+# unreadable, malformed, or turns-less file falls back to a fresh state.
+last_cost=""
+last_prompt_id=""
 cache_state=""
 if [[ -f "$cache_state_file" ]]; then
-    cache_state=$(cat "$cache_state_file" 2>/dev/null)
+    if cache_markers=$(jq -r '
+            if (.turns | type) == "array"
+            then [(.last_cost // ""), (.last_prompt_id // "")] | map(tostring) | join("")
+            else empty end' "$cache_state_file" 2>/dev/null) && [[ -n "$cache_markers" ]]; then
+        cache_state=$(cat "$cache_state_file" 2>/dev/null)
+        IFS="$US" read -r last_cost last_prompt_id <<< "$cache_markers"
+    fi
 fi
-if ! echo "$cache_state" | jq -e '.turns | type == "array"' >/dev/null 2>&1; then
-    cache_state='{"last_cost":null,"last_prompt_id":null,"turns":[]}'
-fi
-
-last_cost=$(echo "$cache_state" | jq -r '.last_cost // empty')
-last_prompt_id=$(echo "$cache_state" | jq -r '.last_prompt_id // empty')
+[[ -z "$cache_state" ]] && cache_state='{"last_cost":null,"last_prompt_id":null,"turns":[]}'
 
 # Turn-boundary detection (compound OR): a new billed API call changes total_cost_usd
 # (per-call granularity), and a new user prompt changes prompt_id -- either one marks a
@@ -209,12 +221,12 @@ prompt_changed=0
 if [[ "$cu_present" == "1" ]] && { [[ $cost_changed -eq 1 ]] || [[ $prompt_changed -eq 1 ]]; }; then
     # cost may be empty (the prompt_id-only case) -- pass JSON null so --argjson stays valid.
     cost_json="${cost:-null}"
-    cache_state=$(echo "$cache_state" | jq \
+    cache_state=$(printf '%s' "$cache_state" | jq \
         --argjson f "$cu_f" --argjson w "$cu_w" --argjson r "$cu_r" \
         --argjson cost "$cost_json" --arg pid "$prompt_id" --argjson n "$cache_n" \
         '.turns += [{"F":$f,"W":$w,"R":$r}] | .turns = (.turns[-$n:]) | .last_cost = $cost | .last_prompt_id = $pid')
     cache_tmp_file="$cache_state_file.tmp.$$"
-    echo "$cache_state" > "$cache_tmp_file" 2>/dev/null && mv -f "$cache_tmp_file" "$cache_state_file" 2>/dev/null
+    printf '%s\n' "$cache_state" > "$cache_tmp_file" 2>/dev/null && mv -f "$cache_tmp_file" "$cache_state_file" 2>/dev/null
 
     # Prune cache-window files older than 1 day — gated to at most once per day via a
     # marker file. A turn boundary can hit multiple times per session, and a directory-wide
@@ -228,12 +240,12 @@ if [[ "$cu_present" == "1" ]] && { [[ $cost_changed -eq 1 ]] || [[ $prompt_chang
     fi
     if [[ $cache_prune_due -eq 1 ]]; then
         touch "$cache_prune_marker" 2>/dev/null
-        find "$cache_dir" -name "claude-statusline-cache-*.json" -type f -mtime +1 ! -name "claude-statusline-cache-$cache_sid.json" -delete 2>/dev/null
+        find "$cache_dir" -name "claude-statusline-cache-*.json" -type f -mtime +1 ! -name "claude-statusline-cache-$safe_sid.json" -delete 2>/dev/null
     fi
 fi
 
 # Pool F/W/R across retained turns and compute savings/zone/fill/pct in one jq call.
-cache_computed=$(echo "$cache_state" | jq -r \
+cache_computed=$(printf '%s' "$cache_state" | jq -r \
     --argjson wread "$cache_w_read" --argjson wwrite "$cache_w_write" \
     --argjson green "$cache_green_at" --argjson cells "$cache_bar_cells" '
     ( [.turns[].F] | add // 0 ) as $F |
@@ -254,24 +266,26 @@ cache_computed=$(echo "$cache_state" | jq -r \
 ')
 IFS=$'\t' read -r cache_pct cache_fill cache_zone <<< "$cache_computed"
 
-# ANSI color codes
-cyan='\033[36m'
-gray='\033[90m'
-blue='\033[94m'
-green='\033[32m'
-yellow='\033[33m'
-red='\033[31m'
-magenta='\033[95m'
-bold_white='\033[1;97m'
-reset='\033[0m'
+# ANSI color codes, stored as real escape bytes. The line is then printed with
+# printf '%s' rather than '%b' -- '%b' would also expand backslash sequences
+# that happen to appear in the interpolated data (model name, email, hostname).
+cyan=$'\033[36m'
+gray=$'\033[90m'
+blue=$'\033[94m'
+green=$'\033[32m'
+yellow=$'\033[33m'
+red=$'\033[31m'
+magenta=$'\033[95m'
+bold_white=$'\033[1;97m'
+reset=$'\033[0m'
 
 # ctx% stage framework (truecolor, thresholds from the Opus staging table)
-ctx_stage1='\033[38;2;34;197;94m'    # 0-30%   Green    #22c55e  Optimal
-ctx_stage2='\033[38;2;20;184;166m'   # 30-50%  Teal     #14b8a6  Healthy
-ctx_stage3='\033[38;2;234;179;8m'    # 50-60%  Yellow   #eab308  Watch
-ctx_stage4='\033[38;2;249;115;22m'   # 60-75%  Orange   #f97316  Handoff zone
-ctx_stage5='\033[38;2;239;68;68m'    # 75-83%  Red      #ef4444  Danger
-ctx_stage6='\033[38;2;153;27;27m'    # 83%+    Dark red #991b1b  Critical/lossy
+ctx_stage1=$'\033[38;2;34;197;94m'    # 0-30%   Green    #22c55e  Optimal
+ctx_stage2=$'\033[38;2;20;184;166m'   # 30-50%  Teal     #14b8a6  Healthy
+ctx_stage3=$'\033[38;2;234;179;8m'    # 50-60%  Yellow   #eab308  Watch
+ctx_stage4=$'\033[38;2;249;115;22m'   # 60-75%  Orange   #f97316  Handoff zone
+ctx_stage5=$'\033[38;2;239;68;68m'    # 75-83%  Red      #ef4444  Danger
+ctx_stage6=$'\033[38;2;153;27;27m'    # 83%+    Dark red #991b1b  Critical/lossy
 
 line=""
 
@@ -294,7 +308,7 @@ if [[ -n "$effort" ]]; then
 fi
 
 # Context usage with 6-stage color
-if [[ -n "$used" && "$used" != "null" ]]; then
+if [[ "$used" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     used_int=$(printf "%.0f" "$used")
     if [[ $used_int -ge 83 ]]; then
         ctx_color="$ctx_stage6"
@@ -330,10 +344,10 @@ if [[ -n "$hostname_val" ]]; then
 fi
 
 # Line 1 output
-printf "%b\n" "$line"
+printf '%s\n' "$line"
 
 # Line 2: 5-hour rate limit bar
-if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_resets" != "null" ]]; then
+if [[ "$rate_used" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$rate_resets" =~ ^[0-9]+$ ]]; then
     pct=$(printf "%.0f" "$rate_used")
 
     bar_width=40
@@ -415,5 +429,5 @@ if [[ -n "$rate_used" && "$rate_used" != "null" && -n "$rate_resets" && "$rate_r
     fi
     session_line="${session_line}${cache_segment}"
 
-    printf "%b" "$session_line"
+    printf '%s' "$session_line"
 fi
