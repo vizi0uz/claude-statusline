@@ -52,8 +52,12 @@ if [[ -z "$ip_refresh_seconds" || -z "$account_refresh_seconds" ]] && [[ -f "$co
     [[ -z "$ip_refresh_seconds" ]] && ip_refresh_seconds="$cfg_ip"
     [[ -z "$account_refresh_seconds" ]] && account_refresh_seconds="$cfg_account"
 fi
-[[ "$ip_refresh_seconds" =~ ^[0-9]+$ ]] || ip_refresh_seconds=60
-[[ "$account_refresh_seconds" =~ ^[0-9]+$ ]] || account_refresh_seconds=60
+# A WAN address changes on the order of hours, and every check is an outbound
+# request to a third party that reveals this machine is online. Poll rarely.
+# The account check has no network cost but spawns `claude auth status` for a
+# value that only changes at login/logout, so it too polls slowly.
+[[ "$ip_refresh_seconds" =~ ^[0-9]+$ ]] || ip_refresh_seconds=900
+[[ "$account_refresh_seconds" =~ ^[0-9]+$ ]] || account_refresh_seconds=300
 
 # Best-effort LAN IP: ask the OS which local address it would route outbound
 # traffic from. This stays correct with multiple NICs/VPNs/Docker bridges,
@@ -338,7 +342,9 @@ if [[ -n "$hostname_val" ]]; then
     if [[ -n "$lan_ip" ]]; then
         line="$line ${gray}/${reset} ${cyan}${lan_ip}${reset}"
     fi
-    if [[ -n "$public_ip" ]]; then
+    # On a host whose outbound address is already public, LAN and WAN are the
+    # same string; printing it twice is noise.
+    if [[ -n "$public_ip" && "$public_ip" != "$lan_ip" ]]; then
         line="$line ${gray}(${reset}${cyan}${public_ip}${reset}${gray})${reset}"
     fi
 fi
