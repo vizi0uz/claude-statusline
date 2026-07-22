@@ -26,7 +26,7 @@ IFS="$US" read -r model effort used session_id rate_used rate_resets \
       (.context_window.current_usage.input_tokens // 0),
       (.context_window.current_usage.cache_creation_input_tokens // 0),
       (.context_window.current_usage.cache_read_input_tokens // 0)
-    ] | map(tostring) | join("")' 2>/dev/null)"
+    ] | map(tostring) | join("\u001f")' 2>/dev/null)"
 
 account_plan=""
 account_email=""
@@ -48,7 +48,7 @@ account_refresh_seconds="$CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS"
 if [[ -z "$ip_refresh_seconds" || -z "$account_refresh_seconds" ]] && [[ -f "$config_file" ]]; then
     IFS="$US" read -r cfg_ip cfg_account <<< "$(jq -r '
         [(.ipRefreshSeconds // ""), (.accountRefreshSeconds // "")]
-        | map(tostring) | join("")' "$config_file" 2>/dev/null)"
+        | map(tostring) | join("\u001f")' "$config_file" 2>/dev/null)"
     [[ -z "$ip_refresh_seconds" ]] && ip_refresh_seconds="$cfg_ip"
     [[ -z "$account_refresh_seconds" ]] && account_refresh_seconds="$cfg_account"
 fi
@@ -95,7 +95,7 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
             <<< "$(jq -r '
                 [(.plan // ""), (.email // ""), (.publicIp // ""),
                  (.accountCheckedAt // 0), (.ipCheckedAt // 0)]
-                | map(tostring) | join("")' "$cache_file" 2>/dev/null)"
+                | map(tostring) | join("\u001f")' "$cache_file" 2>/dev/null)"
     fi
     [[ "$account_checked_at" =~ ^[0-9]+$ ]] || account_checked_at=0
     [[ "$ip_checked_at" =~ ^[0-9]+$ ]] || ip_checked_at=0
@@ -138,7 +138,7 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
                     IFS=$'"'"'\x1f'"'"' read -r plan email ip acct_at ip_at <<< "$(jq -r "
                         [(.plan // \"\"), (.email // \"\"), (.publicIp // \"\"),
                          (.accountCheckedAt // 0), (.ipCheckedAt // 0)]
-                        | map(tostring) | join(\"\")" "$cf" 2>/dev/null)"
+                        | map(tostring) | join(\"\u001f\")" "$cf" 2>/dev/null)"
                     [[ "$acct_at" =~ ^[0-9]+$ ]] || acct_at=0
                     [[ "$ip_at" =~ ^[0-9]+$ ]] || ip_at=0
                 fi
@@ -148,13 +148,13 @@ if [[ "$CLAUDE_STATUSLINE_SHOW_IDENTITY" == "1" ]] && [[ -n "$session_id" ]]; th
                         if [[ "$(printf "%s" "$auth" | jq -r ".loggedIn // false" 2>/dev/null)" == "true" ]]; then
                             IFS=$'"'"'\x1f'"'"' read -r st email <<< "$(printf "%s" "$auth" | jq -r "
                                 [(.subscriptionType // \"\"), (.email // \"\")]
-                                | join(\"\")" 2>/dev/null)"
-                            # Title-case in bash rather than `sed s/\b\(.\)/\u\1/`:
+                                | join(\"\u001f\")" 2>/dev/null)"
+                            # Title-case in awk rather than `sed s/\b\(.\)/\u\1/`:
                             # \b and \u are GNU extensions and emit literal junk
-                            # under BSD sed (macOS).
-                            plan=""
-                            for word in ${st//_/ }; do plan="$plan ${word^}"; done
-                            plan="${plan# }"
+                            # under BSD sed (macOS). toupper/substr are POSIX, and
+                            # `${word^}` is not an option: bash 3.2 ships on macOS.
+                            plan=$(printf "%s" "$st" | awk -F_ \
+                                "{for(i=1;i<=NF;i++) \$i=toupper(substr(\$i,1,1)) substr(\$i,2)}1" OFS=" ")
                         else
                             plan=""; email=""
                         fi
@@ -200,7 +200,7 @@ cache_state=""
 if [[ -f "$cache_state_file" ]]; then
     if cache_markers=$(jq -r '
             if (.turns | type) == "array"
-            then [(.last_cost // ""), (.last_prompt_id // "")] | map(tostring) | join("")
+            then [(.last_cost // ""), (.last_prompt_id // "")] | map(tostring) | join("\u001f")
             else empty end' "$cache_state_file" 2>/dev/null) && [[ -n "$cache_markers" ]]; then
         cache_state=$(cat "$cache_state_file" 2>/dev/null)
         IFS="$US" read -r last_cost last_prompt_id <<< "$cache_markers"
