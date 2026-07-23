@@ -28,7 +28,7 @@ claude-opus [high]  ctx:42%  myhost
 Session ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 40% used · resets in 2h 10m  ·  cache ▓▓▓▓▓▓▓▓▓░ 85%  ·  $1.21
 ```
 
-The hostname segment degrades gracefully: `myhost / LAN_IP (WAN_IP)` when both are known, `myhost / LAN_IP` or `myhost (WAN_IP)` if only one resolved, or plain `myhost` if neither did (e.g. identity flag off).
+The hostname segment degrades gracefully: `myhost / LAN_IP (WAN_IP)` when both are known, `myhost / LAN_IP` or `myhost (WAN_IP)` if only one resolved, or plain `myhost` if neither did (e.g. identity flag off). When LAN and WAN resolve to the same address — a host whose outbound address is already public, like a VPS — it's shown once, without the parentheses.
 
 ## Installation
 
@@ -127,7 +127,7 @@ When the flag is on:
 
 Public IP and account plan/email are cached independently, each with its own refresh interval, since re-checking them costs differently (an HTTP round-trip to `api.ipify.org` vs. spawning `claude auth status`). LAN IP is not affected by either setting since it's always computed live.
 
-Precedence for both: environment variable → JSON config file → default (60 seconds each).
+Precedence for both: environment variable → JSON config file → default (900 seconds for the public IP, 300 for account info). The defaults poll deliberately rarely: a WAN address changes on the order of hours and every check is an outbound request to a third party, while the account value only changes at login/logout but costs a `claude auth status` spawn to observe.
 
 ```bash
 # Environment variables (any positive integer, in seconds)
@@ -143,7 +143,7 @@ Or via a config file at `~/.claude/statusline-config.json` (read on both platfor
 }
 ```
 
-An invalid or missing value falls back to the 60-second default for that setting.
+An invalid or missing value falls back to the default for that setting (900s IP / 300s account).
 
 Note on resumed sessions: `claude --resume <id>` reuses the original session's cache, keyed by `session_id`. If you log into a different account and then resume a session that predates the switch, the display will pick up the new account within one `accountRefreshSeconds` window rather than showing the pre-switch account for the rest of the session.
 

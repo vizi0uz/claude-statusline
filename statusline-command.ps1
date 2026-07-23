@@ -30,11 +30,13 @@ if (-not $ipRefreshSeconds -and (Test-Path $configPath)) {
         if ($cfg.ipRefreshSeconds) { $ipRefreshSeconds = [int]$cfg.ipRefreshSeconds }
     } catch {}
 }
-if (-not $ipRefreshSeconds) { $ipRefreshSeconds = 60 }
+# A WAN address changes on the order of hours, and every check is an outbound
+# request to a third party that reveals this machine is online. Poll rarely.
+if (-not $ipRefreshSeconds) { $ipRefreshSeconds = 900 }
 
 # Account info refresh interval (seconds): env var > ~/.claude/statusline-config.json > default.
-# Unlike the IP check, this re-check spawns `claude auth status`, so the
-# default mirrors $ipRefreshSeconds rather than being shorter.
+# No network cost, but the re-check spawns `claude auth status` to observe a
+# value that only changes at login/logout, so it too polls slowly.
 $accountRefreshSeconds = $null
 if ($env:CLAUDE_STATUSLINE_ACCOUNT_REFRESH_SECONDS) {
     $parsed = 0
@@ -48,7 +50,7 @@ if (-not $accountRefreshSeconds -and (Test-Path $configPath)) {
         if ($cfg.accountRefreshSeconds) { $accountRefreshSeconds = [int]$cfg.accountRefreshSeconds }
     } catch {}
 }
-if (-not $accountRefreshSeconds) { $accountRefreshSeconds = 60 }
+if (-not $accountRefreshSeconds) { $accountRefreshSeconds = 300 }
 
 # Best-effort LAN IP: ask the OS which local address it would route outbound
 # traffic from (a UDP "connect" just resolves the route, no packets sent).
@@ -346,7 +348,9 @@ if ($hostname) {
     if ($lanIp) {
         $line = "$line ${gray}/${reset} ${cyan}${lanIp}${reset}"
     }
-    if ($publicIp) {
+    # On a host whose outbound address is already public, LAN and WAN are the
+    # same string; printing it twice is noise.
+    if ($publicIp -and $publicIp -ne $lanIp) {
         $line = "$line ${gray}(${reset}${cyan}${publicIp}${reset}${gray})${reset}"
     }
 }
